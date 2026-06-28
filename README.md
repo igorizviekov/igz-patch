@@ -64,3 +64,5 @@ Copy `config/igzpatch.example.yml` to the target repository as `.igzpatch.yml`, 
 The companion [`igzpatch-demo`](https://github.com/igorizviekov/igzpatch-demo) repository is a small incident-response dashboard with five independently seeded logic and responsive-CSS failures. Its main branch remains green; each `igzpatch/issue-<number>-...` branch activates the matching deterministic regression test.
 
 See `SPEC.md` for architecture and rollout details.
+
+For the complete deployment and first-run procedure, follow `docs/DEMO_RUNBOOK.md`.
