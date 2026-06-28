@@ -1,0 +1,81 @@
+version: 1
+enabled: true
+
+triggers:
+  labels:
+    - igz:fix
+  commands:
+    - '@IgzPatch fix'
+    - '@IgzPatch status'
+    - '@IgzPatch stop'
+
+repo:
+  default_branch: main
+  language: typescript
+
+branch:
+  prefix: igzpatch
+
+pull_request:
+  draft: true
+  title_template: 'IgzPatch: fix issue #{issue_number}'
+  body_policy: evidence_summary
+
+sandbox:
+  image: node:22-bookworm
+  setup_network: enabled
+  run_network: disabled
+  cpu_limit: 2
+  memory_mb: 4096
+  timeout_minutes: 20
+  setup:
+    - corepack enable
+    - pnpm install --frozen-lockfile
+
+checks:
+  required:
+    - pnpm test
+  optional: []
+
+paths:
+  allowed:
+    - app/**
+    - src/**
+    - tests/**
+  blocked:
+    - .env*
+    - .github/workflows/**
+    - infra/**
+    - auth/**
+    - payments/**
+    - prisma/migrations/**
+
+issue_scope:
+  max_files_changed: 6
+  max_diff_lines: 300
+  requires_acceptance_criteria: true
+
+agent:
+  max_iterations: 3
+  read_only_first_pass: true
+  open_pr_as_draft: true
+  require_manual_merge: true
+
+routing:
+  primary:
+    provider: codex
+    model: gpt-5.4
+  fallback:
+    enabled: false
+    provider: openai
+    model: gpt-5.4
+    conditions: []
+
+audit:
+  comment_strategy: marker_backed_single_comment
+  store_tool_calls: true
+  store_command_logs: true
+  redact_patterns:
+    - sk-
+    - ghp_
+    - github_pat_
