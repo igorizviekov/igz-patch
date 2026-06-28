@@ -4,6 +4,9 @@ import { join } from "node:path";
 import YAML from "yaml";
 import { z } from "zod";
 
+export const agentProviderSchema = z.enum(["codex", "openai", "ollama"]);
+export type AgentProvider = z.infer<typeof agentProviderSchema>;
+
 const repoConfigSchema = z.object({
   version: z.literal(1),
   enabled: z.boolean(),
@@ -51,21 +54,27 @@ const repoConfigSchema = z.object({
     max_diff_lines: z.number().int().positive().default(300),
     requires_acceptance_criteria: z.boolean().default(true),
   }),
-  agent: z.object({
-    max_iterations: z.number().int().positive().default(3),
-    read_only_first_pass: z.boolean().default(true),
-    open_pr_as_draft: z.boolean().default(true),
-    require_manual_merge: z.boolean().default(true),
-  }),
+  agent: z
+    .object({
+      max_iterations: z.number().int().positive().default(3),
+      read_only_first_pass: z.boolean().default(true),
+      open_pr_as_draft: z.boolean().default(true),
+      require_manual_merge: z.boolean().default(true),
+    })
+    .refine((agent) => !agent.read_only_first_pass || agent.max_iterations >= 2, {
+      message: "max_iterations must be at least 2 when read_only_first_pass is enabled",
+      path: ["max_iterations"],
+    }),
   routing: z.object({
     primary: z.object({
-      provider: z.string(),
-      model: z.string(),
+      provider: agentProviderSchema,
+      model: z.string().min(1),
     }),
     fallback: z
       .object({
         enabled: z.boolean().default(false),
-        provider: z.string().default("hosted"),
+        provider: agentProviderSchema.default("openai"),
+        model: z.string().min(1).default("gpt-5.4"),
         conditions: z.array(z.string()).default([]),
       })
       .default({}),
@@ -129,12 +138,13 @@ export const defaultRepoConfig: RepoConfig = {
   },
   routing: {
     primary: {
-      provider: "hosted",
-      model: "configured-by-worker",
+      provider: "codex",
+      model: "gpt-5.4",
     },
     fallback: {
       enabled: false,
-      provider: "hosted",
+      provider: "openai",
+      model: "gpt-5.4",
       conditions: [],
     },
   },

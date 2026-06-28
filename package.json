@@ -12,6 +12,7 @@
     "worker": "tsx src/worker/index.ts",
     "worker:once": "tsx src/worker/index.ts --once",
     "db:init": "psql \"$DATABASE_URL\" -f db/schema.sql",
+    "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

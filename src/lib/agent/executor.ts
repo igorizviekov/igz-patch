@@ -2,8 +2,13 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { assertCommandSucceeded, runShellCommand } from "@/lib/agent/command";
+import {
+  assertCommandSucceeded,
+  runShellCommand,
+  safeExecutionEnvironment,
+} from "@/lib/agent/command";
 import { BlockedRunError, enforceDiffPolicy, readDiffSummary } from "@/lib/agent/diff";
+import { runConfiguredAgent } from "@/lib/agent/providers";
 import { loadRepoConfig } from "@/lib/agent/repo-config";
 import { addRunEvent, updateRun, type RunRecord } from "@/lib/db/runs";
 import { getInstallationOctokit, getInstallationToken } from "@/lib/github/app";
@@ -47,7 +52,11 @@ export async function executeRun(run: RunRecord): Promise<void> {
     });
 
     await runSetup(workspace, config.sandbox.setup, config.sandbox.timeout_minutes);
-    await runAgentCommand(workspace, currentRun, config.sandbox.timeout_minutes);
+    await addRunEvent(run.id, "agent", "Starting configured agent provider", {
+      provider: process.env.IGZPATCH_AGENT_PROVIDER ?? config.routing.primary.provider,
+      model: process.env.IGZPATCH_AGENT_MODEL ?? config.routing.primary.model,
+    });
+    await runAgent(workspace, currentRun, config);
     await runChecks(workspace, config.checks.required, config.sandbox.timeout_minutes);
 
     const diffSummary = await readDiffSummary(workspace);
@@ -131,32 +140,29 @@ async function runSetup(workspace: string, commands: string[], timeoutMinutes: n
       command,
       cwd: workspace,
       timeoutMs: timeoutMinutes * 60_000,
+      env: safeExecutionEnvironment(),
+      inheritEnv: false,
     });
     assertBlockingCommandSucceeded(result, "Setup command failed");
   }
 }
 
-async function runAgentCommand(workspace: string, run: RunRecord, timeoutMinutes: number): Promise<void> {
-  const command = process.env.IGZPATCH_AGENT_COMMAND;
-  if (!command) {
-    throw new BlockedRunError("IGZPATCH_AGENT_COMMAND is not configured.");
+async function runAgent(
+  workspace: string,
+  run: RunRecord,
+  config: ReturnType<typeof loadRepoConfig>,
+): Promise<void> {
+  try {
+    await runConfiguredAgent({
+      workspace,
+      run,
+      config,
+      timeoutMs: config.sandbox.timeout_minutes * 60_000,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new BlockedRunError(`Agent provider failed: ${message}`);
   }
-
-  const result = await runShellCommand({
-    command,
-    cwd: workspace,
-    timeoutMs: timeoutMinutes * 60_000,
-    env: {
-      IGZPATCH_RUN_ID: run.id,
-      IGZPATCH_REPOSITORY: run.repository_full_name,
-      IGZPATCH_ISSUE_NUMBER: String(run.issue_number),
-      IGZPATCH_ISSUE_TITLE: run.issue_title,
-      IGZPATCH_ISSUE_BODY: run.issue_body ?? "",
-      IGZPATCH_ISSUE_URL: run.issue_url,
-      IGZPATCH_WORKSPACE: workspace,
-    },
-  });
-  assertBlockingCommandSucceeded(result, "Agent command failed");
 }
 
 async function runChecks(workspace: string, commands: string[], timeoutMinutes: number): Promise<void> {
@@ -165,6 +171,8 @@ async function runChecks(workspace: string, commands: string[], timeoutMinutes: 
       command,
       cwd: workspace,
       timeoutMs: timeoutMinutes * 60_000,
+      env: safeExecutionEnvironment(),
+      inheritEnv: false,
     });
     assertBlockingCommandSucceeded(result, "Required check failed");
   }

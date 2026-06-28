@@ -63,11 +63,12 @@ agent:
 
 routing:
   primary:
-    provider: hosted
-    model: configured-by-worker
+    provider: codex
+    model: gpt-5.4
   fallback:
     enabled: false
-    provider: hosted
+    provider: openai
+    model: gpt-5.4
     conditions: []
 
 audit:
@@ -78,4 +79,3 @@ audit:
     - sk-
     - ghp_
     - github_pat_
-

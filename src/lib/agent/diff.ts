@@ -8,8 +8,15 @@ export interface DiffSummary {
 }
 
 export async function readDiffSummary(workspace: string): Promise<DiffSummary> {
+  const intentResult = await runShellCommand({
+    command: "git add --intent-to-add --all -- .",
+    cwd: workspace,
+    timeoutMs: 30_000,
+  });
+  assertCommandSucceeded(intentResult);
+
   const result = await runShellCommand({
-    command: "git diff --numstat",
+    command: "git diff --numstat --no-renames",
     cwd: workspace,
     timeoutMs: 30_000,
   });
@@ -20,7 +27,7 @@ export async function readDiffSummary(workspace: string): Promise<DiffSummary> {
   let deletedLines = 0;
 
   for (const line of result.stdout.split("\n")) {
-    const [added, deleted, file] = line.trim().split(/\s+/, 3);
+    const [added, deleted, file] = line.split("\t", 3);
     if (!file) continue;
     changedFiles.push(file);
     addedLines += Number(added) || 0;
@@ -74,4 +81,3 @@ function matchesSimpleGlob(file: string, pattern: string): boolean {
   }
   return file === pattern;
 }
-
