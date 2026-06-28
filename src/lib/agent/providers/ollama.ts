@@ -42,6 +42,9 @@ export async function runOllamaAgent(
     config: request.config,
     timeoutMs: request.timeoutMs,
     deadline,
+    runCheck: request.sandbox
+      ? (command, timeoutMs) => request.sandbox!.runCommand({ command, phase: "run", timeoutMs })
+      : undefined,
   });
 
   return runToolAgent({
@@ -50,6 +53,7 @@ export async function runOllamaAgent(
     toolbox,
     maxIterations: request.config.agent.max_iterations,
     readOnlyFirstPass: request.config.agent.read_only_first_pass,
+    onToolEvent: request.onToolEvent,
   });
 }
 

@@ -11,7 +11,10 @@ create table if not exists igz_runs (
   issue_body text,
   issue_url text not null,
   trigger_kind text not null,
+  trigger_value text not null,
   trigger_actor text,
+  cancel_requested_at timestamptz,
+  cancel_requested_by text,
   status text not null default 'queued',
   lease_owner text,
   lease_expires_at timestamptz,
@@ -28,6 +31,12 @@ create table if not exists igz_runs (
   started_at timestamptz,
   finished_at timestamptz
 );
+
+alter table igz_runs add column if not exists trigger_value text;
+update igz_runs set trigger_value = '' where trigger_value is null;
+alter table igz_runs alter column trigger_value set not null;
+alter table igz_runs add column if not exists cancel_requested_at timestamptz;
+alter table igz_runs add column if not exists cancel_requested_by text;
 
 create index if not exists igz_runs_queue_idx
   on igz_runs (status, created_at)

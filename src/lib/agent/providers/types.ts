@@ -1,5 +1,6 @@
 import type { RunRecord } from "@/lib/db/runs";
 import type { AgentProvider, RepoConfig } from "@/lib/agent/repo-config";
+import type { AgentSandbox } from "@/lib/agent/sandbox";
 
 export interface AgentProviderRequest {
   workspace: string;
@@ -14,6 +15,15 @@ export interface AgentProviderRequest {
   >;
   config: RepoConfig;
   timeoutMs: number;
+  sandbox?: AgentSandbox;
+  onToolEvent?: (event: AgentToolEvent) => Promise<void>;
+}
+
+export interface AgentToolEvent {
+  name: string;
+  arguments: unknown;
+  output: string;
+  ok: boolean;
 }
 
 export interface AgentProviderSelection {

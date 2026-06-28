@@ -10,9 +10,8 @@ export function optionalNumberEnv(name: string, fallback: number): number {
   const value = process.env[name];
   if (!value) return fallback;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`Environment variable ${name} must be a number`);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Environment variable ${name} must be a positive number`);
   }
   return parsed;
 }
-

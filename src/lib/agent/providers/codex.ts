@@ -13,6 +13,16 @@ export async function runCodexAgent(
     env?: Record<string, string | undefined>;
   } = {},
 ): Promise<string> {
+  if (request.sandbox) {
+    const result = await request.sandbox.runCodex({
+      model: selection.model,
+      prompt: buildAgentPrompt(request),
+      timeoutMs: request.timeoutMs,
+    });
+    assertCommandSucceeded(result);
+    return result.stdout.trim() || "Codex completed the patch.";
+  }
+
   const env = options.env ?? process.env;
   const binary = env.IGZPATCH_CODEX_BIN?.trim() || "codex";
   const result = await (options.runProcessImpl ?? runProcess)({

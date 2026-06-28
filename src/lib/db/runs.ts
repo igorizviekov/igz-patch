@@ -20,7 +20,10 @@ export interface RunRecord {
   issue_body: string | null;
   issue_url: string;
   trigger_kind: string;
+  trigger_value: string;
   trigger_actor: string | null;
+  cancel_requested_at: Date | null;
+  cancel_requested_by: string | null;
   status: RunStatus;
   lease_owner: string | null;
   lease_expires_at: Date | null;
@@ -48,6 +51,7 @@ export interface CreateRunInput {
   issueBody?: string | null;
   issueUrl: string;
   triggerKind: string;
+  triggerValue: string;
   triggerActor?: string | null;
 }
 
@@ -64,6 +68,7 @@ export async function createRun(input: CreateRunInput): Promise<RunRecord> {
       issue_body,
       issue_url,
       trigger_kind,
+      trigger_value,
       trigger_actor
     )
     values (
@@ -76,15 +81,22 @@ export async function createRun(input: CreateRunInput): Promise<RunRecord> {
       ${input.issueBody ?? null},
       ${input.issueUrl},
       ${input.triggerKind},
+      ${input.triggerValue},
       ${input.triggerActor ?? null}
     )
-    on conflict (github_delivery_id) do update
-      set updated_at = igz_runs.updated_at
+    on conflict (github_delivery_id) do nothing
     returning *
   `;
-  if (!run) throw new Error("Failed to create or load run");
-  await addRunEvent(run.id, "queued", `Queued from ${input.triggerKind}`);
-  return run;
+  if (run) {
+    await addRunEvent(run.id, "queued", `Queued from ${input.triggerKind}`);
+    return run;
+  }
+
+  const [existing] = await sql<RunRecord[]>`
+    select * from igz_runs where github_delivery_id = ${input.githubDeliveryId}
+  `;
+  if (!existing) throw new Error("Failed to create or load run");
+  return existing;
 }
 
 export async function claimNextRun(workerId: string, leaseMs: number): Promise<RunRecord | null> {
@@ -157,6 +169,7 @@ export async function updateRun(
 
   const next = { ...current, ...fields };
   const isTerminal = ["succeeded", "blocked", "failed"].includes(next.status);
+  const releasesLease = isTerminal || next.status === "queued";
 
   const [updated] = await sql<RunRecord[]>`
     update igz_runs
@@ -168,9 +181,12 @@ export async function updateRun(
       pull_request_url = ${next.pull_request_url},
       blocked_reason = ${next.blocked_reason},
       error_message = ${next.error_message},
-      lease_owner = ${isTerminal ? null : next.lease_owner},
-      lease_expires_at = ${isTerminal ? null : next.lease_expires_at},
-      finished_at = ${isTerminal ? new Date() : next.finished_at},
+      lease_owner = case when ${releasesLease} then null else lease_owner end,
+      lease_expires_at = case when ${releasesLease} then null else lease_expires_at end,
+      finished_at = case
+        when ${isTerminal} then coalesce(finished_at, now())
+        else null
+      end,
       updated_at = now()
     where id = ${runId}
     returning *
@@ -200,4 +216,90 @@ export async function listRecentRuns(limit = 25): Promise<RunRecord[]> {
     order by created_at desc
     limit ${limit}
   `;
+}
+
+export async function findLatestRunForIssue(
+  repositoryFullName: string,
+  issueNumber: number,
+): Promise<RunRecord | null> {
+  const sql = getSql();
+  const [run] = await sql<RunRecord[]>`
+    select *
+    from igz_runs
+    where repository_full_name = ${repositoryFullName} and issue_number = ${issueNumber}
+    order by created_at desc
+    limit 1
+  `;
+  return run ?? null;
+}
+
+export async function requestRunCancellation(
+  repositoryFullName: string,
+  issueNumber: number,
+  actor: string | null,
+): Promise<RunRecord | null> {
+  const sql = getSql();
+  const [run] = await sql<RunRecord[]>`
+    update igz_runs
+    set
+      cancel_requested_at = now(),
+      cancel_requested_by = ${actor},
+      status = case when status = 'queued' then 'blocked' else status end,
+      blocked_reason = case when status = 'queued' then 'Cancelled before execution' else blocked_reason end,
+      finished_at = case when status = 'queued' then now() else finished_at end,
+      lease_owner = case when status = 'queued' then null else lease_owner end,
+      lease_expires_at = case when status = 'queued' then null else lease_expires_at end,
+      updated_at = now()
+    where id = (
+      select id
+      from igz_runs
+      where
+        repository_full_name = ${repositoryFullName}
+        and issue_number = ${issueNumber}
+        and status in ('queued', 'running')
+      order by created_at desc
+      limit 1
+    )
+    returning *
+  `;
+  if (run) {
+    await addRunEvent(run.id, "cancellation_requested", "Cancellation requested", {
+      actor: actor ?? "unknown",
+    });
+  }
+  return run ?? null;
+}
+
+export async function isRunCancellationRequested(runId: string): Promise<boolean> {
+  const sql = getSql();
+  const [run] = await sql<{ cancel_requested_at: Date | null }[]>`
+    select cancel_requested_at from igz_runs where id = ${runId}
+  `;
+  return Boolean(run?.cancel_requested_at);
+}
+
+export async function failExhaustedRuns(): Promise<number> {
+  const sql = getSql();
+  const exhausted = await sql<Pick<RunRecord, "id">[]>`
+    update igz_runs
+    set
+      status = 'failed',
+      error_message = 'Retry attempts exhausted',
+      lease_owner = null,
+      lease_expires_at = null,
+      finished_at = now(),
+      updated_at = now()
+    where
+      attempts >= max_attempts
+      and (
+        status = 'queued'
+        or (status = 'running' and lease_expires_at < now())
+      )
+    returning id
+  `;
+
+  for (const run of exhausted) {
+    await addRunEvent(run.id, "failed", "Retry attempts exhausted");
+  }
+  return exhausted.length;
 }

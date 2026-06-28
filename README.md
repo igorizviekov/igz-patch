@@ -1,12 +1,22 @@
-# igz-patch
+# IgzPatch
 
-Thoughtful patching for focused experiments.
+Bounded, auditable issue-to-draft-PR automation.
 
-IgzPatch turns a labeled GitHub issue into a bounded draft pull request. A Next.js control plane queues runs, and a long-running worker clones the target repository, invokes a configurable coding agent, runs deterministic checks, enforces diff policy, and opens the PR.
+IgzPatch turns an explicitly labeled GitHub issue into a small draft pull request. A Next.js control plane verifies webhooks and queues durable runs; a long-running worker leases each run, clones the target repository, invokes a configurable coding agent inside Docker, runs deterministic checks, enforces repository policy, and opens a draft PR.
 
-## Agent providers
+## Safety Model
 
-Choose the default provider and model in the target repository's `.igzpatch.yml`:
+- Repositories opt in with `enabled: true` in `.igzpatch.yml`; missing config is disabled.
+- GitHub access uses short-lived installation tokens and refreshes the token before push.
+- Setup, provider tools, and checks run in disposable Docker containers with CPU, memory, process, capability, filesystem, and timeout limits.
+- Setup network access and run network access are configured separately; run commands default to no network.
+- Allowed paths, blocked paths, changed-file count, and diff-line limits are enforced before push.
+- At least one deterministic required check is mandatory for enabled repositories.
+- Pull requests are always drafts and always require human merge.
+
+## Agent Providers
+
+Choose one provider and model in the target repository:
 
 ```yaml
 routing:
@@ -19,22 +29,38 @@ The worker can override both values with `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH
 
 | Provider | Runtime requirement | Authentication |
 | --- | --- | --- |
-| `codex` | Codex CLI available as `codex`, or `IGZPATCH_CODEX_BIN` | Saved Codex login or `CODEX_API_KEY` |
-| `openai` | Network access to the OpenAI Responses API | `OPENAI_API_KEY` |
-| `ollama` | Ollama server and the configured model | None for local `http://localhost:11434` |
+| `codex` | Built `IGZPATCH_CODEX_IMAGE` | `CODEX_API_KEY` |
+| `openai` | Network access to the Responses API | `OPENAI_API_KEY` |
+| `ollama` | Reachable Ollama server and model | Optional `OLLAMA_API_KEY` |
 
-The OpenAI and Ollama adapters share a bounded tool loop for file discovery, reads, exact replacements, writes, diffs, and configured checks. Write tools enforce `paths.allowed` and `paths.blocked`; check execution receives a secret-free environment. Codex runs non-interactively in `workspace-write` mode and keeps secrets out of model-proposed subprocesses through its shell environment policy.
+OpenAI and Ollama use the same bounded file/check tool loop. Codex runs non-interactively in `workspace-write` mode; model-generated shell commands have network disabled even though the Codex process can reach the API. Provider fallback is intentionally deferred.
 
-## Development
+## Local Setup
 
-Requires Node.js 20.9 or newer.
+Requires Node.js 20.9+, Docker, Postgres, and a GitHub App.
 
 ```bash
 npm install
 cp .env.example .env
+npm run db:init
+npm run docker:build-agent
 npm run typecheck
 npm test
-npm run worker:once
 ```
 
-See `SPEC.md` for architecture and `config/igzpatch.example.yml` for the full repository contract.
+Run the web control plane and worker as separate processes:
+
+```bash
+npm run dev
+npm run worker
+```
+
+The worker can run on this machine, a Mac Mini, or a small always-on host. It pulls this repository like any Node service, loads `.env`, needs Docker and outbound GitHub/provider access, and polls the shared Postgres database. It does not need a separate code repository.
+
+## Repository Contract
+
+Copy `config/igzpatch.example.yml` to the target repository as `.igzpatch.yml`, then narrow its paths and checks. Configuration is validated fail-closed, including unknown fields. Maintainer-only issue commands are `@IgzPatch fix`, `@IgzPatch status`, and `@IgzPatch stop`.
+
+The companion [`igzpatch-demo`](https://github.com/igorizviekov/igzpatch-demo) repository is a small incident-response dashboard with five independently seeded logic and responsive-CSS failures. Its main branch remains green; each `igzpatch/issue-<number>-...` branch activates the matching deterministic regression test.
+
+See `SPEC.md` for architecture and rollout details.
