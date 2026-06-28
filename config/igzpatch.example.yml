@@ -53,6 +53,8 @@ paths:
 issue_scope:
   max_files_changed: 6
   max_diff_lines: 300
+  max_file_bytes: 1000000
+  max_patch_bytes: 2000000
   requires_acceptance_criteria: true
 
 agent:

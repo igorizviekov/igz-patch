@@ -45,6 +45,9 @@ export async function runOllamaAgent(
     runCheck: request.sandbox
       ? (command, timeoutMs) => request.sandbox!.runCommand({ command, phase: "run", timeoutMs })
       : undefined,
+    runTool: request.sandbox
+      ? (name, input, timeoutMs) => request.sandbox!.runTool({ name, arguments: input, timeoutMs })
+      : undefined,
   });
 
   return runToolAgent({

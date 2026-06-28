@@ -1,5 +1,6 @@
 import type { CreateRunInput } from "@/lib/db/runs";
 import type { RepoConfig } from "@/lib/agent/repo-config";
+import { z } from "zod";
 
 export interface WebhookRepositoryContext {
   installationId: number;
@@ -7,7 +8,7 @@ export interface WebhookRepositoryContext {
   repositoryFullName: string;
 }
 
-interface WebhookPayload {
+export interface WebhookPayload {
   action?: string;
   installation?: { id?: number };
   repository?: {
@@ -31,6 +32,56 @@ interface WebhookPayload {
   sender?: { login?: string };
 }
 
+const webhookPayloadSchema = z.object({
+  action: z.string().max(100).optional(),
+  installation: z.object({ id: z.number().int().positive().optional() }).passthrough().optional(),
+  repository: z.object({
+    id: z.number().int().positive().optional(),
+    full_name: z.string().max(255).regex(/^[^/\s]+\/[^/\s]+$/).optional(),
+  }).passthrough().optional(),
+  issue: z.object({
+    number: z.number().int().positive().optional(),
+    title: z.string().max(1_000).optional(),
+    html_url: z.string().url().max(2_000).optional(),
+    body: z.string().max(200_000).nullable().optional(),
+    pull_request: z.unknown().optional(),
+    labels: z.array(z.object({ name: z.string().max(255).optional() }).passthrough()).max(100).optional(),
+  }).passthrough().optional(),
+  label: z.object({ name: z.string().max(255).optional() }).passthrough().optional(),
+  comment: z.object({
+    body: z.string().max(200_000).optional(),
+    user: z.object({ login: z.string().max(255).optional() }).passthrough().optional(),
+    author_association: z.string().max(100).optional(),
+  }).passthrough().optional(),
+  sender: z.object({ login: z.string().max(255).optional() }).passthrough().optional(),
+}).passthrough();
+
+export function parseWebhookPayload(value: unknown): WebhookPayload {
+  return webhookPayloadSchema.parse(value);
+}
+
+export function durableRunCandidate({
+  eventName,
+  deliveryId,
+  payload,
+}: {
+  eventName: string;
+  deliveryId: string;
+  payload: WebhookPayload;
+}): CreateRunInput | null {
+  if (!payload.issue || payload.issue.pull_request) return null;
+  const trigger = eventName === "issues" && payload.action === "labeled"
+    ? payload.label?.name?.trim() || null
+    : eventName === "issue_comment"
+      && payload.action === "created"
+      && isMaintainerAssociation(payload.comment?.author_association)
+      ? String(payload.comment?.body ?? "").split(/\r?\n/).map((line) => line.trim())
+          .find((line) => /^@[^\s]+\s+fix$/i.test(line)) ?? null
+      : null;
+  if (!trigger) return null;
+  return baseRunInput(payload, deliveryId, eventName === "issues" ? "issues.labeled" : "issue_comment.command", trigger);
+}
+
 export function runInputFromWebhook({
   eventName,
   deliveryId,
@@ -45,52 +96,16 @@ export function runInputFromWebhook({
   if (eventName !== "issues" && eventName !== "issue_comment") return null;
   if (!payload.issue || payload.issue.pull_request) return null;
 
-  const installationId = payload.installation?.id;
-  const repositoryId = payload.repository?.id;
-  const repositoryFullName = payload.repository?.full_name;
-  const issueNumber = payload.issue.number;
-  const issueTitle = payload.issue.title;
-  const issueBody = payload.issue.body ?? null;
-  const issueUrl = payload.issue.html_url;
-
-  if (!installationId || !repositoryId || !repositoryFullName || !issueNumber || !issueTitle || !issueUrl) {
-    return null;
-  }
-
   if (eventName === "issues") {
     const label = issueEventTrigger(payload, triggers.labels);
     if (!label) return null;
-    return {
-      githubDeliveryId: deliveryId,
-      installationId,
-      repositoryId,
-      repositoryFullName,
-      issueNumber,
-      issueTitle,
-      issueBody,
-      issueUrl,
-      triggerKind: `issues.${payload.action ?? "unknown"}`,
-      triggerValue: label,
-      triggerActor: payload.sender?.login ?? null,
-    };
+    return baseRunInput(payload, deliveryId, `issues.${payload.action ?? "unknown"}`, label);
   }
 
   if (eventName === "issue_comment") {
     const command = issueCommentTrigger(payload, triggers.commands);
     if (!command || commandAction(command) !== "fix") return null;
-    return {
-      githubDeliveryId: deliveryId,
-      installationId,
-      repositoryId,
-      repositoryFullName,
-      issueNumber,
-      issueTitle,
-      issueBody,
-      issueUrl,
-      triggerKind: "issue_comment.command",
-      triggerValue: command,
-      triggerActor: payload.comment?.user?.login ?? payload.sender?.login ?? null,
-    };
+    return baseRunInput(payload, deliveryId, "issue_comment.command", command);
   }
 
   return null;
@@ -114,16 +129,37 @@ export function configuredIssueCommand(
 }
 
 function issueEventTrigger(payload: WebhookPayload, labels: string[]): string | null {
-  if (!["opened", "reopened", "edited", "labeled"].includes(payload.action ?? "")) return null;
+  if (payload.action !== "labeled") return null;
   const configuredLabels = new Map(labels.map((label) => [normalize(label), label]));
-  if (payload.action === "labeled") {
-    return configuredLabels.get(normalize(payload.label?.name)) ?? null;
-  }
-  for (const label of payload.issue?.labels ?? []) {
-    const configured = configuredLabels.get(normalize(label.name));
-    if (configured) return configured;
-  }
-  return null;
+  return configuredLabels.get(normalize(payload.label?.name)) ?? null;
+}
+
+function baseRunInput(
+  payload: WebhookPayload,
+  deliveryId: string,
+  triggerKind: string,
+  triggerValue: string,
+): CreateRunInput | null {
+  const installationId = payload.installation?.id;
+  const repositoryId = payload.repository?.id;
+  const repositoryFullName = payload.repository?.full_name;
+  const issueNumber = payload.issue?.number;
+  const issueTitle = payload.issue?.title;
+  const issueUrl = payload.issue?.html_url;
+  if (!installationId || !repositoryId || !repositoryFullName || !issueNumber || !issueTitle || !issueUrl) return null;
+  return {
+    githubDeliveryId: deliveryId,
+    installationId,
+    repositoryId,
+    repositoryFullName,
+    issueNumber,
+    issueTitle,
+    issueBody: payload.issue?.body ?? null,
+    issueUrl,
+    triggerKind,
+    triggerValue,
+    triggerActor: payload.comment?.user?.login ?? payload.sender?.login ?? null,
+  };
 }
 
 function issueCommentTrigger(payload: WebhookPayload, commands: string[]): string | null {

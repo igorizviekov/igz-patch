@@ -1,4 +1,5 @@
 import type postgres from "postgres";
+import { randomUUID } from "node:crypto";
 
 import { getSql } from "@/lib/db/client";
 
@@ -26,6 +27,7 @@ export interface RunRecord {
   cancel_requested_by: string | null;
   status: RunStatus;
   lease_owner: string | null;
+  lease_token: string | null;
   lease_expires_at: Date | null;
   attempts: number;
   max_attempts: number;
@@ -53,6 +55,18 @@ export interface CreateRunInput {
   triggerKind: string;
   triggerValue: string;
   triggerActor?: string | null;
+}
+
+export interface RunLease {
+  owner: string;
+  token: string;
+}
+
+export class LeaseLostError extends Error {
+  constructor(runId: string) {
+    super(`Worker no longer owns the active lease for run ${runId}`);
+    this.name = "LeaseLostError";
+  }
 }
 
 export async function createRun(input: CreateRunInput): Promise<RunRecord> {
@@ -84,7 +98,7 @@ export async function createRun(input: CreateRunInput): Promise<RunRecord> {
       ${input.triggerValue},
       ${input.triggerActor ?? null}
     )
-    on conflict (github_delivery_id) do nothing
+    on conflict do nothing
     returning *
   `;
   if (run) {
@@ -93,7 +107,15 @@ export async function createRun(input: CreateRunInput): Promise<RunRecord> {
   }
 
   const [existing] = await sql<RunRecord[]>`
-    select * from igz_runs where github_delivery_id = ${input.githubDeliveryId}
+    select * from igz_runs
+    where github_delivery_id = ${input.githubDeliveryId}
+       or (
+         repository_full_name = ${input.repositoryFullName}
+         and issue_number = ${input.issueNumber}
+         and status in ('queued', 'running')
+       )
+    order by (github_delivery_id = ${input.githubDeliveryId}) desc
+    limit 1
   `;
   if (!existing) throw new Error("Failed to create or load run");
   return existing;
@@ -101,6 +123,7 @@ export async function createRun(input: CreateRunInput): Promise<RunRecord> {
 
 export async function claimNextRun(workerId: string, leaseMs: number): Promise<RunRecord | null> {
   const sql = getSql();
+  const leaseToken = randomUUID();
   return sql.begin(async (tx) => {
     const [candidate] = await tx<Pick<RunRecord, "id" | "attempts" | "max_attempts">[]>`
       select id, attempts, max_attempts
@@ -123,6 +146,7 @@ export async function claimNextRun(workerId: string, leaseMs: number): Promise<R
       set
         status = 'running',
         lease_owner = ${workerId},
+        lease_token = ${leaseToken},
         lease_expires_at = now() + (${String(leaseMs)} || ' milliseconds')::interval,
         attempts = attempts + 1,
         started_at = coalesce(started_at, now()),
@@ -135,15 +159,21 @@ export async function claimNextRun(workerId: string, leaseMs: number): Promise<R
   });
 }
 
-export async function heartbeatRun(runId: string, workerId: string, leaseMs: number): Promise<void> {
+export async function heartbeatRun(runId: string, lease: RunLease, leaseMs: number): Promise<void> {
   const sql = getSql();
-  await sql`
+  const renewed = await sql<{ id: string }[]>`
     update igz_runs
     set
       lease_expires_at = now() + (${String(leaseMs)} || ' milliseconds')::interval,
       updated_at = now()
-    where id = ${runId} and lease_owner = ${workerId} and status = 'running'
+    where id = ${runId}
+      and lease_owner = ${lease.owner}
+      and lease_token = ${lease.token}
+      and status = 'running'
+      and lease_expires_at > now()
+    returning id
   `;
+  if (renewed.length !== 1) throw new LeaseLostError(runId);
 }
 
 export async function updateRun(
@@ -161,11 +191,37 @@ export async function updateRun(
     >
   >,
 ): Promise<RunRecord> {
+  return updateRunInternal(runId, fields);
+}
+
+export async function updateRunWithLease(
+  runId: string,
+  lease: RunLease,
+  fields: Parameters<typeof updateRun>[1],
+): Promise<RunRecord> {
+  return updateRunInternal(runId, fields, lease);
+}
+
+async function updateRunInternal(
+  runId: string,
+  fields: Parameters<typeof updateRun>[1],
+  lease?: RunLease,
+): Promise<RunRecord> {
   const sql = getSql();
   const [current] = await sql<RunRecord[]>`
-    select * from igz_runs where id = ${runId}
+    select * from igz_runs
+    where id = ${runId}
+      and (${lease?.owner ?? null}::text is null or (
+        lease_owner = ${lease?.owner ?? null}
+        and lease_token = ${lease?.token ?? null}
+        and status = 'running'
+        and lease_expires_at > now()
+      ))
   `;
-  if (!current) throw new Error(`Run not found: ${runId}`);
+  if (!current) {
+    if (lease) throw new LeaseLostError(runId);
+    throw new Error(`Run not found: ${runId}`);
+  }
 
   const next = { ...current, ...fields };
   const isTerminal = ["succeeded", "blocked", "failed"].includes(next.status);
@@ -182,6 +238,7 @@ export async function updateRun(
       blocked_reason = ${next.blocked_reason},
       error_message = ${next.error_message},
       lease_owner = case when ${releasesLease} then null else lease_owner end,
+      lease_token = case when ${releasesLease} then null else lease_token end,
       lease_expires_at = case when ${releasesLease} then null else lease_expires_at end,
       finished_at = case
         when ${isTerminal} then coalesce(finished_at, now())
@@ -189,9 +246,18 @@ export async function updateRun(
       end,
       updated_at = now()
     where id = ${runId}
+      and (${lease?.owner ?? null}::text is null or (
+        lease_owner = ${lease?.owner ?? null}
+        and lease_token = ${lease?.token ?? null}
+        and status = 'running'
+        and lease_expires_at > now()
+      ))
     returning *
   `;
-  if (!updated) throw new Error(`Failed to update run: ${runId}`);
+  if (!updated) {
+    if (lease) throw new LeaseLostError(runId);
+    throw new Error(`Failed to update run: ${runId}`);
+  }
   return updated;
 }
 
@@ -206,6 +272,42 @@ export async function addRunEvent(
     insert into igz_run_events (run_id, event_type, message, metadata)
     values (${runId}, ${eventType}, ${message}, ${sql.json(metadata)})
   `;
+}
+
+export async function addRunEventWithLease(
+  runId: string,
+  lease: RunLease,
+  eventType: string,
+  message: string,
+  metadata: postgres.JSONValue = {},
+): Promise<void> {
+  const sql = getSql();
+  const inserted = await sql<{ id: number }[]>`
+    insert into igz_run_events (run_id, event_type, message, metadata)
+    select id, ${eventType}, ${message}, ${sql.json(metadata)}
+    from igz_runs
+    where id = ${runId}
+      and lease_owner = ${lease.owner}
+      and lease_token = ${lease.token}
+      and status = 'running'
+      and lease_expires_at > now()
+    returning id
+  `;
+  if (inserted.length !== 1) throw new LeaseLostError(runId);
+}
+
+export async function assertRunLease(runId: string, lease: RunLease): Promise<void> {
+  const sql = getSql();
+  const [run] = await sql<{ id: string }[]>`
+    select id
+    from igz_runs
+    where id = ${runId}
+      and lease_owner = ${lease.owner}
+      and lease_token = ${lease.token}
+      and status = 'running'
+      and lease_expires_at > now()
+  `;
+  if (!run) throw new LeaseLostError(runId);
 }
 
 export async function listRecentRuns(limit = 25): Promise<RunRecord[]> {
@@ -248,6 +350,7 @@ export async function requestRunCancellation(
       blocked_reason = case when status = 'queued' then 'Cancelled before execution' else blocked_reason end,
       finished_at = case when status = 'queued' then now() else finished_at end,
       lease_owner = case when status = 'queued' then null else lease_owner end,
+      lease_token = case when status = 'queued' then null else lease_token end,
       lease_expires_at = case when status = 'queued' then null else lease_expires_at end,
       updated_at = now()
     where id = (
@@ -286,6 +389,7 @@ export async function failExhaustedRuns(): Promise<number> {
       status = 'failed',
       error_message = 'Retry attempts exhausted',
       lease_owner = null,
+      lease_token = null,
       lease_expires_at = null,
       finished_at = now(),
       updated_at = now()

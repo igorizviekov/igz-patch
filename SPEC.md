@@ -76,7 +76,7 @@ GitHub issue label/comment
 
 | Component | MVP Choice | Reason |
 | --- | --- | --- |
-| Public app | Next.js App Router on Vercel | Simple webhook receiver and dashboard in one deploy |
+| Control plane | Next.js App Router on Vercel | Public webhook receiver and password-protected dashboard in one deploy |
 | GitHub auth | GitHub App installation tokens | Minimum-permission identity, no personal token actions |
 | Webhook verification | HMAC SHA-256 verification | Required safety boundary for public endpoint |
 | Queue | Supabase Postgres job table | Durable, inspectable, low effort, supports polling leases |
@@ -180,6 +180,8 @@ paths:
 issue_scope:
   max_files_changed: 6
   max_diff_lines: 300
+  max_file_bytes: 1000000
+  max_patch_bytes: 2000000
   requires_acceptance_criteria: true
 
 agent:
@@ -216,7 +218,8 @@ Important queue behavior:
 
 - `github_delivery_id` is unique for idempotency.
 - Workers claim with `FOR UPDATE SKIP LOCKED`.
-- Every claim writes a `lease_owner`, `lease_expires_at`, and increments `attempts`.
+- Every claim writes a unique `lease_token`, `lease_owner`, `lease_expires_at`, and increments `attempts`.
+- Worker state changes and audit events are fenced by owner, token, status, and unexpired lease.
 - Expired leases can be reclaimed until `max_attempts`.
 - Terminal statuses are `succeeded`, `blocked`, and `failed`.
 

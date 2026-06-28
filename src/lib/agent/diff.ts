@@ -1,40 +1,88 @@
+import { lstatSync } from "node:fs";
+import { join } from "node:path";
+
 import type { RepoConfig } from "@/lib/agent/repo-config";
-import { assertCommandSucceeded, runShellCommand } from "@/lib/agent/command";
+import { assertCommandSucceeded, runProcess } from "@/lib/agent/command";
+import { hardenedGitEnvironment, protectedGitArguments } from "@/lib/agent/git-security";
 
 export interface DiffSummary {
   changedFiles: string[];
   addedLines: number;
   deletedLines: number;
+  binaryFiles: string[];
+  fileBytes: Record<string, number>;
+  patchBytes: number;
 }
 
 export async function readDiffSummary(workspace: string): Promise<DiffSummary> {
-  const intentResult = await runShellCommand({
-    command: "git add --intent-to-add --all -- .",
-    cwd: workspace,
-    timeoutMs: 30_000,
-  });
+  const intentResult = await runGit(workspace, ["add", "--intent-to-add", "--all", "--", "."]);
   assertCommandSucceeded(intentResult);
 
-  const result = await runShellCommand({
-    command: "git diff --numstat --no-renames",
-    cwd: workspace,
-    timeoutMs: 30_000,
-  });
+  const result = await runGit(workspace, ["diff", "--numstat", "-z", "--no-renames", "--"]);
   assertCommandSucceeded(result);
 
+  const patch = await readBinaryPatch(workspace, 5_000_000);
   const changedFiles: string[] = [];
+  const binaryFiles: string[] = [];
+  const fileBytes: Record<string, number> = {};
   let addedLines = 0;
   let deletedLines = 0;
 
-  for (const line of result.stdout.split("\n")) {
-    const [added, deleted, file] = line.split("\t", 3);
+  for (const record of result.stdout.split("\0")) {
+    if (!record) continue;
+    const firstTab = record.indexOf("\t");
+    const secondTab = record.indexOf("\t", firstTab + 1);
+    if (firstTab === -1 || secondTab === -1) continue;
+    const added = record.slice(0, firstTab);
+    const deleted = record.slice(firstTab + 1, secondTab);
+    const file = record.slice(secondTab + 1);
     if (!file) continue;
     changedFiles.push(file);
-    addedLines += Number(added) || 0;
-    deletedLines += Number(deleted) || 0;
+    if (added === "-" || deleted === "-") binaryFiles.push(file);
+    else {
+      addedLines += Number(added);
+      deletedLines += Number(deleted);
+    }
+    try {
+      fileBytes[file] = lstatSync(join(workspace, file)).size;
+    } catch {
+      fileBytes[file] = 0;
+    }
   }
 
-  return { changedFiles, addedLines, deletedLines };
+  return {
+    changedFiles,
+    addedLines,
+    deletedLines,
+    binaryFiles,
+    fileBytes,
+    patchBytes: Buffer.byteLength(patch),
+  };
+}
+
+export async function readBinaryPatch(workspace: string, maximumBytes: number): Promise<string> {
+  const result = await runGit(
+    workspace,
+    ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-renames", "--"],
+    maximumBytes + 1,
+  );
+  if (result.outputLimitExceeded) {
+    throw new BlockedRunError(`Patch exceeds the maximum transport size of ${maximumBytes} bytes.`);
+  }
+  assertCommandSucceeded(result);
+  return result.stdout;
+}
+
+async function runGit(workspace: string, args: string[], maxOutputBytes?: number) {
+  return runProcess({
+    command: "git",
+    args: protectedGitArguments(args),
+    cwd: workspace,
+    timeoutMs: 30_000,
+    env: hardenedGitEnvironment(),
+    inheritEnv: false,
+    maxOutputBytes,
+  });
 }
 
 export function enforceDiffPolicy(summary: DiffSummary, config: RepoConfig): void {
@@ -53,6 +101,24 @@ export function enforceDiffPolicy(summary: DiffSummary, config: RepoConfig): voi
     throw new BlockedRunError(
       `Diff has ${diffLines} changed lines, above max ${config.issue_scope.max_diff_lines}.`,
     );
+  }
+
+  if (summary.binaryFiles.length > 0) {
+    throw new BlockedRunError(`Binary changes are not allowed: ${summary.binaryFiles.join(", ")}`);
+  }
+
+  if (summary.patchBytes > config.issue_scope.max_patch_bytes) {
+    throw new BlockedRunError(
+      `Patch is ${summary.patchBytes} bytes, above max ${config.issue_scope.max_patch_bytes}.`,
+    );
+  }
+
+  for (const [file, bytes] of Object.entries(summary.fileBytes)) {
+    if (bytes > config.issue_scope.max_file_bytes) {
+      throw new BlockedRunError(
+        `Changed file ${file} is ${bytes} bytes, above max ${config.issue_scope.max_file_bytes}.`,
+      );
+    }
   }
 
   for (const file of summary.changedFiles) {

@@ -1,21 +1,24 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 import {
+  defaultRepoConfig,
+  loadRepoConfigFromGitHub,
+  RepoConfigValidationError,
+} from "@/lib/agent/repo-config";
+import {
   addRunEvent,
   createRun,
   findLatestRunForIssue,
   requestRunCancellation,
   updateRun,
+  type RunRecord,
 } from "@/lib/db/runs";
-import {
-  defaultRepoConfig,
-  loadRepoConfigFromGitHub,
-  RepoConfigValidationError,
-} from "@/lib/agent/repo-config";
 import { requiredEnv } from "@/lib/env";
 import { getInstallationOctokit } from "@/lib/github/app";
 import {
   configuredIssueCommand,
+  durableRunCandidate,
+  parseWebhookPayload,
   runInputFromWebhook,
   webhookRepositoryContext,
 } from "@/lib/github/events";
@@ -24,65 +27,73 @@ import { upsertRunStatusComment } from "@/lib/github/status-comment";
 
 export const runtime = "nodejs";
 
+const maximumWebhookBytes = 1_000_000;
+
 export async function POST(request: NextRequest) {
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > maximumWebhookBytes) {
+    return NextResponse.json({ error: "Webhook payload is too large" }, { status: 413 });
+  }
+
   const rawBody = await request.text();
+  if (Buffer.byteLength(rawBody) > maximumWebhookBytes) {
+    return NextResponse.json({ error: "Webhook payload is too large" }, { status: 413 });
+  }
   const signature = request.headers.get("x-hub-signature-256");
   const eventName = request.headers.get("x-github-event") ?? "";
   const deliveryId = request.headers.get("x-github-delivery") ?? "";
 
-  if (!deliveryId) {
-    return NextResponse.json({ error: "Missing X-GitHub-Delivery" }, { status: 400 });
+  if (!deliveryId || deliveryId.length > 255) {
+    return NextResponse.json({ error: "Missing or invalid X-GitHub-Delivery" }, { status: 400 });
   }
-
-  const verified = verifyGitHubSignature({
+  if (!verifyGitHubSignature({
     body: rawBody,
     signature,
     secret: requiredEnv("GITHUB_WEBHOOK_SECRET"),
-  });
-
-  if (!verified) {
+  })) {
     return NextResponse.json({ error: "Invalid GitHub signature" }, { status: 401 });
   }
 
-  let payload: Parameters<typeof runInputFromWebhook>[0]["payload"];
+  let payload;
   try {
-    payload = JSON.parse(rawBody) as Parameters<typeof runInputFromWebhook>[0]["payload"];
+    payload = parseWebhookPayload(JSON.parse(rawBody) as unknown);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid GitHub webhook payload" }, { status: 400 });
   }
-
   if (eventName !== "issues" && eventName !== "issue_comment") {
     return NextResponse.json({ accepted: false, ignored: true });
   }
 
   const repositoryContext = webhookRepositoryContext(payload);
-  if (!repositoryContext) {
-    return NextResponse.json({ accepted: false, ignored: true });
-  }
+  if (!repositoryContext) return NextResponse.json({ accepted: false, ignored: true });
   const [owner, repo] = repositoryContext.repositoryFullName.split("/");
-  if (!owner || !repo) {
-    return NextResponse.json({ error: "Invalid repository name" }, { status: 400 });
-  }
+  if (!owner || !repo) return NextResponse.json({ error: "Invalid repository name" }, { status: 400 });
+
+  const candidate = durableRunCandidate({ eventName, deliveryId, payload });
+  const durableRun = candidate ? await createRun(candidate) : null;
+  const ownsDurableDelivery = durableRun?.github_delivery_id === deliveryId;
 
   let repoConfig = defaultRepoConfig;
   let configValidationError: string | null = null;
-  let octokit: Awaited<ReturnType<typeof getInstallationOctokit>>;
+  let octokit: Awaited<ReturnType<typeof getInstallationOctokit>> | null = null;
   try {
     octokit = await getInstallationOctokit(repositoryContext.installationId);
     repoConfig = await loadRepoConfigFromGitHub({ octokit, owner, repo });
   } catch (error) {
-    if (!(error instanceof RepoConfigValidationError)) throw error;
-    configValidationError = error.message;
-    octokit = await getInstallationOctokit(repositoryContext.installationId);
+    if (error instanceof RepoConfigValidationError) configValidationError = error.message;
+    else if (durableRun) {
+      return NextResponse.json(
+        { accepted: true, runId: durableRun.id, status: durableRun.status, configPending: true },
+        { status: 202 },
+      );
+    } else throw error;
   }
 
-  if (eventName === "issue_comment") {
+  if (eventName === "issue_comment" && octokit) {
     const configuredCommand = configuredIssueCommand(payload, repoConfig.triggers.commands);
     if (configuredCommand?.action === "status" || configuredCommand?.action === "stop") {
       const issueNumber = payload.issue?.number;
-      if (!issueNumber) {
-        return NextResponse.json({ accepted: false, ignored: true });
-      }
+      if (!issueNumber) return NextResponse.json({ accepted: false, ignored: true });
       const actor = payload.comment?.user?.login ?? payload.sender?.login ?? null;
       const run = configuredCommand.action === "stop"
         ? await requestRunCancellation(repositoryContext.repositoryFullName, issueNumber, actor)
@@ -107,37 +118,43 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  if (!configValidationError && !repoConfig.enabled) {
-    return NextResponse.json({ accepted: false, ignored: true, reason: "disabled" });
+  if (!durableRun) return NextResponse.json({ accepted: false, ignored: true });
+  if (!ownsDurableDelivery) {
+    return NextResponse.json({
+      accepted: true,
+      duplicate: true,
+      runId: durableRun.id,
+      status: durableRun.status,
+    });
   }
-
-  const input = runInputFromWebhook({
-    eventName,
-    deliveryId,
-    payload,
-    triggers: repoConfig.triggers,
-  });
-
-  if (!input) {
-    return NextResponse.json({ accepted: false, ignored: true });
-  }
-
-  const run = await createRun(input);
   if (configValidationError) {
-    const message = `Repository config validation failed: ${configValidationError}`;
-    const blocked = await updateRun(run.id, {
-      status: "blocked",
-      blocked_reason: message,
-      error_message: null,
-    });
-    await addRunEvent(run.id, "blocked", message);
-    await upsertRunStatusComment({
-      octokit,
-      run: blocked,
-      headline: "blocked",
-      details: [message],
-    });
-    return NextResponse.json({ accepted: true, runId: blocked.id, status: blocked.status });
+    return blockRun(durableRun, `Repository config validation failed: ${configValidationError}`, octokit);
   }
-  return NextResponse.json({ accepted: true, runId: run.id, status: run.status });
+  if (!repoConfig.enabled) return blockRun(durableRun, "IgzPatch is disabled by repository config.", octokit);
+
+  const configuredInput = runInputFromWebhook({ eventName, deliveryId, payload, triggers: repoConfig.triggers });
+  if (!configuredInput) {
+    return blockRun(durableRun, "Webhook trigger does not match repository config.", octokit);
+  }
+  return NextResponse.json({ accepted: true, runId: durableRun.id, status: durableRun.status });
+}
+
+async function blockRun(
+  run: RunRecord,
+  message: string,
+  octokit: Awaited<ReturnType<typeof getInstallationOctokit>> | null,
+) {
+  const blocked = await updateRun(run.id, {
+    status: "blocked",
+    blocked_reason: message,
+    error_message: null,
+  });
+  await addRunEvent(run.id, "blocked", message);
+  if (octokit) {
+    try {
+      await upsertRunStatusComment({ octokit, run: blocked, headline: "blocked", details: [message] });
+    } catch {
+    }
+  }
+  return NextResponse.json({ accepted: true, runId: blocked.id, status: blocked.status });
 }

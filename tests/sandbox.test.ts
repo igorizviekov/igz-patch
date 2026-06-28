@@ -27,8 +27,9 @@ test("Docker setup containers enforce resources and allow setup networking", () 
   assertArgPair(args, "--cap-drop", "ALL");
   assertArgPair(args, "--security-opt", "no-new-privileges");
   assertArgPair(args, "--volume", "/tmp/repository:/workspace:rw");
+  assert.ok(args.includes("/tmp/repository/.git:/workspace/.git:ro"));
   assert.ok(args.includes("--read-only"));
-  assert.equal(args.filter((arg) => arg.includes(":/workspace")).length, 1);
+  assert.equal(args.filter((arg) => arg.includes(":/workspace")).length, 2);
 });
 
 test("Docker run phase disables network and never exposes environment values in arguments", () => {
@@ -66,10 +67,12 @@ test("Codex provider container keeps API networking separate from command networ
       "-",
     ],
     containerEnv: { CODEX_API_KEY: "not-visible" },
+    workspaceReadOnly: true,
   });
 
   assertArgPair(args, "--network", "bridge");
   assert.ok(args.includes("sandbox_workspace_write.network_access=false"));
+  assert.ok(args.includes("/tmp/repository:/workspace:ro"));
   assert.equal(args.includes("not-visible"), false);
 });
 

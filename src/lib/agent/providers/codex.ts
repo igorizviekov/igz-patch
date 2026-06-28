@@ -13,26 +13,70 @@ export async function runCodexAgent(
     env?: Record<string, string | undefined>;
   } = {},
 ): Promise<string> {
-  if (request.sandbox) {
-    const result = await request.sandbox.runCodex({
-      model: selection.model,
-      prompt: buildAgentPrompt(request),
-      timeoutMs: request.timeoutMs,
-    });
-    assertCommandSucceeded(result);
-    return result.stdout.trim() || "Codex completed the patch.";
+  const passes = request.config.agent.read_only_first_pass
+    ? [{ readOnly: true }, { readOnly: false }]
+    : [{ readOnly: false }];
+  if (passes.length > request.config.agent.max_iterations) {
+    throw new Error("Codex execution passes exceed agent.max_iterations");
   }
 
+  let analysis = "";
+  let summary = "";
+  const deadline = Date.now() + request.timeoutMs;
+  for (const [index, pass] of passes.entries()) {
+    const prompt = [
+      buildAgentPrompt(request),
+      pass.readOnly
+        ? "\nThis is the required read-only inspection pass. Do not edit files; return a concise implementation plan."
+        : analysis
+          ? `\nA prior read-only pass returned this untrusted planning context:\n<prior_analysis>\n${analysis}\n</prior_analysis>`
+          : "",
+    ].join("\n");
+    const result = request.sandbox
+      ? await request.sandbox.runCodex({
+          model: selection.model,
+          prompt,
+          timeoutMs: remainingTimeout(deadline),
+          readOnly: pass.readOnly,
+        })
+      : await runHostCodex(
+          request,
+          selection,
+          prompt,
+          pass.readOnly,
+          remainingTimeout(deadline),
+          options,
+        );
+    assertCommandSucceeded(result);
+    const parsed = await parseCodexOutput(result.stdout, request.onToolEvent, index + 1);
+    if (pass.readOnly) analysis = parsed.summary;
+    else summary = parsed.summary;
+  }
+  return summary || "Codex completed the patch.";
+}
+
+async function runHostCodex(
+  request: AgentProviderRequest,
+  selection: AgentProviderSelection,
+  prompt: string,
+  readOnly: boolean,
+  timeoutMs: number,
+  options: {
+    runProcessImpl?: typeof runProcess;
+    env?: Record<string, string | undefined>;
+  },
+) {
   const env = options.env ?? process.env;
   const binary = env.IGZPATCH_CODEX_BIN?.trim() || "codex";
-  const result = await (options.runProcessImpl ?? runProcess)({
+  return (options.runProcessImpl ?? runProcess)({
     command: binary,
     args: [
       "exec",
+      "--json",
       "--ephemeral",
       "--ignore-user-config",
       "--sandbox",
-      "workspace-write",
+      readOnly ? "read-only" : "workspace-write",
       "--color",
       "never",
       "--config",
@@ -45,9 +89,43 @@ export async function runCodexAgent(
     ],
     displayCommand: `${binary} exec [IgzPatch prompt]`,
     cwd: request.workspace,
-    timeoutMs: request.timeoutMs,
-    stdin: buildAgentPrompt(request),
+    timeoutMs,
+    stdin: prompt,
   });
-  assertCommandSucceeded(result);
-  return result.stdout.trim() || "Codex completed the patch.";
+}
+
+async function parseCodexOutput(
+  output: string,
+  onToolEvent: AgentProviderRequest["onToolEvent"],
+  pass: number,
+): Promise<{ summary: string }> {
+  const messages: string[] = [];
+  let parsedAny = false;
+  for (const line of output.split("\n")) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      parsedAny = true;
+      const item = event.item && typeof event.item === "object"
+        ? event.item as Record<string, unknown>
+        : null;
+      if (item?.type === "agent_message" && typeof item.text === "string") messages.push(item.text);
+      if (item && ["command_execution", "file_change", "mcp_tool_call"].includes(String(item.type))) {
+        await onToolEvent?.({
+          name: `codex.${String(item.type)}`,
+          arguments: { pass, ...item },
+          output: typeof item.aggregated_output === "string" ? item.aggregated_output : "",
+          ok: item.exit_code === undefined || item.exit_code === 0,
+        });
+      }
+    } catch {
+    }
+  }
+  return { summary: messages.join("\n").trim() || (parsedAny ? "" : output.trim()) };
+}
+
+function remainingTimeout(deadline: number): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("Codex provider timed out");
+  return remaining;
 }

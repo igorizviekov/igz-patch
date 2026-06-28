@@ -6,7 +6,10 @@ export interface CommandResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  outputLimitExceeded?: boolean;
 }
+
+export const defaultMaximumCommandOutputBytes = 1_000_000;
 
 export function runShellCommand({
   command,
@@ -41,6 +44,7 @@ export function runProcess({
   env = {},
   inheritEnv = true,
   stdin,
+  maxOutputBytes = defaultMaximumCommandOutputBytes,
 }: {
   command: string;
   args?: string[];
@@ -50,6 +54,7 @@ export function runProcess({
   env?: Record<string, string>;
   inheritEnv?: boolean;
   stdin?: string;
+  maxOutputBytes?: number;
 }): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -64,6 +69,8 @@ export function runProcess({
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let outputLimitExceeded = false;
+    let capturedBytes = 0;
     let settled = false;
     const renderedCommand = displayCommand ?? [command, ...args].join(" ");
     const timer = setTimeout(() => {
@@ -73,12 +80,21 @@ export function runProcess({
     }, timeoutMs);
 
     child.stdin.end(stdin);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
+    const capture = (stream: "stdout" | "stderr", chunk: Buffer | string) => {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, maxOutputBytes - capturedBytes);
+      const captured = value.subarray(0, remaining).toString("utf8");
+      capturedBytes += Math.min(value.length, remaining);
+      if (stream === "stdout") stdout += captured;
+      else stderr += captured;
+      if (value.length > remaining && !outputLimitExceeded) {
+        outputLimitExceeded = true;
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
+      }
+    };
+    child.stdout.on("data", (chunk) => capture("stdout", chunk));
+    child.stderr.on("data", (chunk) => capture("stderr", chunk));
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -89,13 +105,14 @@ export function runProcess({
         stdout,
         stderr: [stderr, error.message].filter(Boolean).join("\n"),
         timedOut,
+        outputLimitExceeded,
       });
     });
     child.on("close", (exitCode) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ command: renderedCommand, exitCode, stdout, stderr, timedOut });
+      resolve({ command: renderedCommand, exitCode, stdout, stderr, timedOut, outputLimitExceeded });
     });
   });
 }
@@ -134,10 +151,12 @@ export function safeExecutionEnvironment(
 }
 
 export function assertCommandSucceeded(result: CommandResult): void {
-  if (result.exitCode !== 0) {
+  if (result.exitCode !== 0 || result.outputLimitExceeded) {
     throw new Error(
       [
-        result.timedOut
+        result.outputLimitExceeded
+          ? `Command exceeded the output limit: ${result.command}`
+          : result.timedOut
           ? `Command timed out: ${result.command}`
           : `Command failed (${result.exitCode}): ${result.command}`,
         result.stderr.trim(),

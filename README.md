@@ -8,9 +8,12 @@ IgzPatch turns an explicitly labeled GitHub issue into a small draft pull reques
 
 - Repositories opt in with `enabled: true` in `.igzpatch.yml`; missing config is disabled.
 - GitHub access uses short-lived installation tokens and refreshes the token before push.
-- Setup, provider tools, and checks run in disposable Docker containers with CPU, memory, process, capability, filesystem, and timeout limits.
+- Setup, provider tools, and checks run in disposable Docker containers with CPU, memory, process, capability, filesystem, output, and timeout limits; Git metadata is mounted read-only.
 - Setup network access and run network access are configured separately; run commands default to no network.
-- Allowed paths, blocked paths, changed-file count, and diff-line limits are enforced before push.
+- Allowed paths, blocked paths, changed-file count, diff-line, file-byte, patch-byte, image, and worker resource limits are enforced before push.
+- Untrusted work is transported as a bounded binary patch into a fresh checkout; only that trusted checkout can commit or receive GitHub credentials.
+- Every claim has a unique lease token, and worker writes fail atomically after lease expiry or reassignment.
+- The run dashboard requires HTTP Basic authentication through `IGZPATCH_DASHBOARD_PASSWORD`.
 - At least one deterministic required check is mandatory for enabled repositories.
 - Pull requests are always drafts and always require human merge.
 
@@ -60,6 +63,8 @@ The worker can run on this machine, a Mac Mini, or a small always-on host. It pu
 ## Repository Contract
 
 Copy `config/igzpatch.example.yml` to the target repository as `.igzpatch.yml`, then narrow its paths and checks. Configuration is validated fail-closed, including unknown fields. Maintainer-only issue commands are `@IgzPatch fix`, `@IgzPatch status`, and `@IgzPatch stop`.
+
+The worker accepts only images in `IGZPATCH_ALLOWED_SANDBOX_IMAGES` and only package-manager setup/check command forms. Repository policy can tighten worker limits but cannot raise them.
 
 The companion [`igzpatch-demo`](https://github.com/igorizviekov/igzpatch-demo) repository is a small incident-response dashboard with five independently seeded logic and responsive-CSS failures. Its main branch remains green; each `igzpatch/issue-<number>-...` branch activates the matching deterministic regression test.
 

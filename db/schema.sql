@@ -17,6 +17,7 @@ create table if not exists igz_runs (
   cancel_requested_by text,
   status text not null default 'queued',
   lease_owner text,
+  lease_token text,
   lease_expires_at timestamptz,
   attempts integer not null default 0,
   max_attempts integer not null default 3,
@@ -37,6 +38,7 @@ update igz_runs set trigger_value = '' where trigger_value is null;
 alter table igz_runs alter column trigger_value set not null;
 alter table igz_runs add column if not exists cancel_requested_at timestamptz;
 alter table igz_runs add column if not exists cancel_requested_by text;
+alter table igz_runs add column if not exists lease_token text;
 
 create index if not exists igz_runs_queue_idx
   on igz_runs (status, created_at)
@@ -44,6 +46,29 @@ create index if not exists igz_runs_queue_idx
 
 create index if not exists igz_runs_repo_issue_idx
   on igz_runs (repository_full_name, issue_number, created_at desc);
+
+with duplicate_active_runs as (
+  select id, row_number() over (
+    partition by repository_full_name, issue_number
+    order by created_at asc
+  ) as position
+  from igz_runs
+  where status in ('queued', 'running')
+)
+update igz_runs
+set
+  status = 'blocked',
+  blocked_reason = 'Superseded while enabling single-active-run enforcement',
+  lease_owner = null,
+  lease_token = null,
+  lease_expires_at = null,
+  finished_at = now(),
+  updated_at = now()
+where id in (select id from duplicate_active_runs where position > 1);
+
+create unique index if not exists igz_runs_active_issue_idx
+  on igz_runs (repository_full_name, issue_number)
+  where status in ('queued', 'running');
 
 create table if not exists igz_run_events (
   id bigserial primary key,
