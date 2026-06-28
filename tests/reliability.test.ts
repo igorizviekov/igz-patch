@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
 
+import { assertCommandSucceeded, runProcess } from "@/lib/agent/command";
 import { optionalNumberEnv } from "@/lib/env";
 import { verifyGitHubSignature } from "@/lib/github/signature";
 import { redactText } from "@/lib/redaction";
@@ -55,6 +56,32 @@ test("lease heartbeat renews periodically and stops cleanly", async () => {
   assert.equal(heartbeats, stoppedAt);
 });
 
+test("lease heartbeat makes renewal failures fatal to the worker", async () => {
+  const lease = startLeaseHeartbeat({
+    leaseMs: 20,
+    minimumIntervalMs: 5,
+    heartbeat: async () => {
+      throw new Error("lease lost");
+    },
+  });
+  await wait(15);
+  assert.throws(() => lease.assertActive(), /lease lost/);
+  await lease.stop();
+});
+
+test("process output is bounded and terminates flooding commands", async () => {
+  const result = await runProcess({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('x'.repeat(100000))"],
+    cwd: process.cwd(),
+    timeoutMs: 5_000,
+    maxOutputBytes: 256,
+  });
+  assert.equal(result.outputLimitExceeded, true);
+  assert.ok(Buffer.byteLength(result.stdout) <= 256);
+  assert.throws(() => assertCommandSucceeded(result), /output limit/);
+});
+
 test("webhook signatures are verified without accepting malformed values", () => {
   const body = JSON.stringify({ action: "labeled" });
   const secret = "webhook-secret";
@@ -68,12 +95,14 @@ test("audit redaction removes token bodies and private keys", () => {
   const value = [
     "token sk-exampleSecret123",
     "github github_pat_exampleSecret456",
+    "Authorization: Basic dXNlcjpzZWNyZXQ=",
+    "DATABASE_URL=postgres://user:password@db.example/app",
     "-----BEGIN PRIVATE KEY-----",
     "secret-material",
     "-----END PRIVATE KEY-----",
   ].join("\n");
   const redacted = redactText(value, ["sk-", "github_pat_"]);
-  assert.doesNotMatch(redacted, /exampleSecret|secret-material/);
+  assert.doesNotMatch(redacted, /exampleSecret|secret-material|dXNlcjpzZWNyZXQ|user:password/);
   assert.match(redacted, /\[REDACTED\]/);
   assert.match(redacted, /\[REDACTED PRIVATE KEY\]/);
 });

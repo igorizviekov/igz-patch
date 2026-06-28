@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   configuredIssueCommand,
+  durableRunCandidate,
+  parseWebhookPayload,
   runInputFromWebhook,
   webhookRepositoryContext,
 } from "@/lib/github/events";
@@ -135,4 +137,38 @@ test("pull request comments and incomplete repository contexts are ignored", () 
     null,
   );
   assert.equal(webhookRepositoryContext({ repository: basePayload.repository }), null);
+});
+
+test("durable candidates are derived without repository config", () => {
+  assert.equal(durableRunCandidate({
+    eventName: "issues",
+    deliveryId: "durable-label",
+    payload: basePayload,
+  })?.triggerValue, "custom:fix");
+  assert.equal(durableRunCandidate({
+    eventName: "issue_comment",
+    deliveryId: "durable-command",
+    payload: {
+      ...basePayload,
+      action: "created",
+      comment: { body: "@CustomBot fix", author_association: "MEMBER" },
+    },
+  })?.triggerValue, "@CustomBot fix");
+});
+
+test("issue edits do not retrigger runs and malformed payloads are rejected", () => {
+  assert.equal(runInputFromWebhook({
+    eventName: "issues",
+    deliveryId: "delivery-edit",
+    payload: { ...basePayload, action: "edited" },
+    triggers,
+  }), null);
+  assert.throws(() => parseWebhookPayload({
+    ...basePayload,
+    repository: { ...basePayload.repository, full_name: "not-a-repository" },
+  }));
+  assert.throws(() => parseWebhookPayload({
+    ...basePayload,
+    issue: { ...basePayload.issue, body: "x".repeat(200_001) },
+  }));
 });

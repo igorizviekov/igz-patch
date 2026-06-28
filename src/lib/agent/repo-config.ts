@@ -58,6 +58,8 @@ const repoConfigSchema = z.object({
   issue_scope: z.object({
     max_files_changed: z.number().int().positive().default(6),
     max_diff_lines: z.number().int().positive().default(300),
+    max_file_bytes: z.number().int().positive().default(1_000_000),
+    max_patch_bytes: z.number().int().positive().default(2_000_000),
     requires_acceptance_criteria: z.boolean().default(true),
   }).strict(),
   agent: z
@@ -134,6 +136,8 @@ export const defaultRepoConfig: RepoConfig = {
   issue_scope: {
     max_files_changed: 6,
     max_diff_lines: 300,
+    max_file_bytes: 1_000_000,
+    max_patch_bytes: 2_000_000,
     requires_acceptance_criteria: true,
   },
   agent: {
@@ -165,6 +169,64 @@ export function parseRepoConfig(source: string): RepoConfig {
     const message = error instanceof Error ? error.message : String(error);
     throw new RepoConfigValidationError(message, { cause: error });
   }
+}
+
+const workerPolicyLimits = {
+  cpu_limit: 4,
+  memory_mb: 8192,
+  timeout_minutes: 30,
+  max_files_changed: 20,
+  max_diff_lines: 2_000,
+  max_file_bytes: 2_000_000,
+  max_patch_bytes: 5_000_000,
+} as const;
+
+const defaultAllowedImages = new Set(["node:22-bookworm"]);
+
+export function enforceWorkerRepoPolicy(
+  config: RepoConfig,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  const violations = [
+    ["sandbox.cpu_limit", config.sandbox.cpu_limit, workerPolicyLimits.cpu_limit],
+    ["sandbox.memory_mb", config.sandbox.memory_mb, workerPolicyLimits.memory_mb],
+    ["sandbox.timeout_minutes", config.sandbox.timeout_minutes, workerPolicyLimits.timeout_minutes],
+    ["issue_scope.max_files_changed", config.issue_scope.max_files_changed, workerPolicyLimits.max_files_changed],
+    ["issue_scope.max_diff_lines", config.issue_scope.max_diff_lines, workerPolicyLimits.max_diff_lines],
+    ["issue_scope.max_file_bytes", config.issue_scope.max_file_bytes, workerPolicyLimits.max_file_bytes],
+    ["issue_scope.max_patch_bytes", config.issue_scope.max_patch_bytes, workerPolicyLimits.max_patch_bytes],
+  ] as const;
+  for (const [name, value, maximum] of violations) {
+    if (value > maximum) throw new RepoConfigValidationError(`${name} exceeds worker maximum ${maximum}`);
+  }
+
+  const allowedImages = new Set(
+    (env.IGZPATCH_ALLOWED_SANDBOX_IMAGES ?? [...defaultAllowedImages].join(","))
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  if (!allowedImages.has(config.sandbox.image)) {
+    throw new RepoConfigValidationError(`sandbox.image is not allowed by this worker: ${config.sandbox.image}`);
+  }
+  for (const command of config.sandbox.setup) assertAllowedRepoCommand(command, "setup");
+  for (const command of [...config.checks.required, ...config.checks.optional]) {
+    assertAllowedRepoCommand(command, "check");
+  }
+}
+
+export function assertAllowedRepoCommand(command: string, phase: "setup" | "check"): void {
+  if (!command.trim() || /[\n\r;&|><`()$\\]/.test(command)) {
+    throw new RepoConfigValidationError(`${phase} command contains unsupported shell syntax: ${command}`);
+  }
+  const words = command.trim().split(/\s+/);
+  const [binary, subcommand] = words;
+  const allowed = phase === "setup"
+    ? (binary === "corepack" && subcommand === "enable")
+      || (["npm", "pnpm", "yarn"].includes(binary ?? "") && ["ci", "install"].includes(subcommand ?? ""))
+    : ["npm", "pnpm", "yarn"].includes(binary ?? "")
+      && (subcommand === "test" || subcommand === "run" || subcommand === "exec");
+  if (!allowed) throw new RepoConfigValidationError(`${phase} command is not allowlisted: ${command}`);
 }
 
 export async function loadRepoConfigFromGitHub({

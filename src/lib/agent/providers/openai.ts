@@ -48,6 +48,9 @@ export async function runOpenAiAgent(
     runCheck: request.sandbox
       ? (command, timeoutMs) => request.sandbox!.runCommand({ command, phase: "run", timeoutMs })
       : undefined,
+    runTool: request.sandbox
+      ? (name, input, timeoutMs) => request.sandbox!.runTool({ name, arguments: input, timeoutMs })
+      : undefined,
   });
 
   return runToolAgent({
@@ -94,7 +97,7 @@ export function createOpenAiSession({
           input: inputs.map(toOpenAiInput),
           tools: tools.map(toOpenAiTool),
           parallel_tool_calls: false,
-          store: true,
+          store: false,
           ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
         }),
         signal: AbortSignal.timeout(remainingTimeout(deadline)),

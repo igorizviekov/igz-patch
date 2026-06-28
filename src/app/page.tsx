@@ -6,8 +6,8 @@ export default async function Home() {
 
   try {
     runs = await listRecentRuns(20);
-  } catch (error) {
-    setupMessage = error instanceof Error ? error.message : String(error);
+  } catch {
+    setupMessage = "The run database is currently unavailable.";
   }
 
   return (
@@ -77,4 +77,3 @@ export default async function Home() {
     </main>
   );
 }
-

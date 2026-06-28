@@ -3,7 +3,7 @@ import "dotenv/config";
 import { executeRun } from "@/lib/agent/executor";
 import {
   claimNextRun,
-  addRunEvent,
+  addRunEventWithLease,
   failExhaustedRuns,
   heartbeatRun,
 } from "@/lib/db/runs";
@@ -25,14 +25,16 @@ async function main(): Promise<void> {
       continue;
     }
 
-    await addRunEvent(run.id, "claimed", `Claimed by ${workerId}`);
+    if (!run.lease_token) throw new Error(`Claimed run ${run.id} has no lease token`);
+    const lease = { owner: workerId, token: run.lease_token };
+    await addRunEventWithLease(run.id, lease, "claimed", `Claimed by ${workerId}`);
     const leaseHeartbeat = startLeaseHeartbeat({
       leaseMs,
-      heartbeat: () => heartbeatRun(run.id, workerId, leaseMs),
+      heartbeat: () => heartbeatRun(run.id, lease, leaseMs),
       onError: (error) => console.error("Lease heartbeat failed", error),
     });
     try {
-      await executeRun(run);
+      await executeRun(run, lease, () => leaseHeartbeat.assertActive());
     } finally {
       await leaseHeartbeat.stop();
     }

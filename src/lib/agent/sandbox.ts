@@ -7,7 +7,8 @@ import {
   safeExecutionEnvironment,
   type CommandResult,
 } from "@/lib/agent/command";
-import type { RepoConfig } from "@/lib/agent/repo-config";
+import { assertAllowedRepoCommand, type RepoConfig } from "@/lib/agent/repo-config";
+import { sandboxToolRunnerSource } from "@/lib/agent/sandbox-tool-runner";
 
 export type SandboxPhase = "setup" | "run";
 
@@ -21,6 +22,12 @@ export interface AgentSandbox {
   runCodex(input: {
     model: string;
     prompt: string;
+    timeoutMs: number;
+    readOnly: boolean;
+  }): Promise<CommandResult>;
+  runTool(input: {
+    name: string;
+    arguments: unknown;
     timeoutMs: number;
   }): Promise<CommandResult>;
   cleanupRuntime(): void;
@@ -61,6 +68,7 @@ export function createDockerSandbox({
     commandArgs,
     containerEnv = {},
     displayCommand,
+    workspaceReadOnly = false,
   }: {
     image: string;
     phase: SandboxPhase | "provider";
@@ -70,6 +78,7 @@ export function createDockerSandbox({
     commandArgs: string[];
     containerEnv?: Record<string, string>;
     displayCommand: string;
+    workspaceReadOnly?: boolean;
   }): Promise<CommandResult> {
     mkdirSync(runtimeDirectory, { recursive: true });
     const name = nextContainerName(phase);
@@ -90,6 +99,7 @@ export function createDockerSandbox({
       entrypoint,
       commandArgs,
       containerEnv: effectiveContainerEnv,
+      workspaceReadOnly,
     });
     const result = await runProcess({
       command: dockerBinary,
@@ -101,8 +111,10 @@ export function createDockerSandbox({
       inheritEnv: false,
       stdin,
     });
+    if (result.timedOut || result.outputLimitExceeded) {
+      await removeContainer(dockerBinary, workspace, name, env);
+    }
     activeContainers.delete(name);
-    if (result.timedOut) await removeContainer(dockerBinary, workspace, name);
     return result;
   }
 
@@ -120,6 +132,7 @@ export function createDockerSandbox({
       assertCommandSucceeded(result);
     },
     async runCommand({ command, phase, timeoutMs }) {
+      assertAllowedRepoCommand(command, phase === "setup" ? "setup" : "check");
       const normalizedCommand = normalizeSandboxCommand(command);
       const script = renderSandboxScript(normalizedCommand);
       const result = await runContainer({
@@ -133,7 +146,7 @@ export function createDockerSandbox({
       });
       return { ...result, command };
     },
-    async runCodex({ model, prompt, timeoutMs }) {
+    async runCodex({ model, prompt, timeoutMs, readOnly }) {
       const apiKey = env.CODEX_API_KEY;
       if (!apiKey?.trim()) {
         throw new Error("CODEX_API_KEY is required when the Codex provider runs in Docker.");
@@ -146,10 +159,11 @@ export function createDockerSandbox({
         entrypoint: "codex",
         commandArgs: [
           "exec",
+          "--json",
           "--ephemeral",
           "--ignore-user-config",
           "--sandbox",
-          "workspace-write",
+          readOnly ? "read-only" : "workspace-write",
           "--color",
           "never",
           "--config",
@@ -164,6 +178,24 @@ export function createDockerSandbox({
         ],
         containerEnv: { CODEX_API_KEY: apiKey, CODEX_HOME: "/tmp/codex" },
         displayCommand: "docker run [Codex provider]",
+        workspaceReadOnly: readOnly,
+      });
+    },
+    async runTool({ name, arguments: toolArguments, timeoutMs }) {
+      const payload = Buffer.from(JSON.stringify({
+        name,
+        arguments: toolArguments,
+        allowed: config.paths.allowed,
+        blocked: config.paths.blocked,
+      })).toString("base64url");
+      return runContainer({
+        image: config.sandbox.image,
+        phase: "run",
+        timeoutMs,
+        entrypoint: "node",
+        commandArgs: ["-"],
+        stdin: `process.argv[2] = ${JSON.stringify(payload)};\n${sandboxToolRunnerSource}`,
+        displayCommand: `sandbox tool ${name}`,
       });
     },
     cleanupRuntime() {
@@ -171,7 +203,7 @@ export function createDockerSandbox({
     },
     async dispose() {
       await Promise.all(
-        [...activeContainers].map((name) => removeContainer(dockerBinary, workspace, name)),
+        [...activeContainers].map((name) => removeContainer(dockerBinary, workspace, name, env)),
       );
       activeContainers.clear();
       rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -188,6 +220,7 @@ export function buildDockerRunArgs({
   entrypoint,
   commandArgs,
   containerEnv = {},
+  workspaceReadOnly = false,
 }: {
   name: string;
   workspace: string;
@@ -197,6 +230,7 @@ export function buildDockerRunArgs({
   entrypoint: string;
   commandArgs: string[];
   containerEnv?: Record<string, string>;
+  workspaceReadOnly?: boolean;
 }): string[] {
   const network = phase === "provider"
     ? "bridge"
@@ -230,7 +264,9 @@ export function buildDockerRunArgs({
     "--tmpfs",
     "/tmp:rw,noexec,nosuid,size=268435456",
     "--volume",
-    `${workspace}:/workspace:rw`,
+    `${workspace}:/workspace:${workspaceReadOnly ? "ro" : "rw"}`,
+    "--volume",
+    `${join(workspace, ".git")}:/workspace/.git:ro`,
     "--workdir",
     "/workspace",
     "--entrypoint",
@@ -266,16 +302,24 @@ async function removeContainer(
   dockerBinary: string,
   workspace: string,
   name: string,
+  sourceEnv: Record<string, string | undefined> = process.env,
 ): Promise<void> {
-  await runProcess({
+  const result = await runProcess({
     command: dockerBinary,
     args: ["rm", "--force", name],
     displayCommand: `docker rm --force ${name}`,
     cwd: workspace,
     timeoutMs: 15_000,
-    env: safeExecutionEnvironment(),
+    env: {
+      ...safeExecutionEnvironment(sourceEnv as NodeJS.ProcessEnv),
+      ...(sourceEnv.DOCKER_CONTEXT ? { DOCKER_CONTEXT: sourceEnv.DOCKER_CONTEXT } : {}),
+      ...(sourceEnv.DOCKER_HOST ? { DOCKER_HOST: sourceEnv.DOCKER_HOST } : {}),
+    },
     inheritEnv: false,
   });
+  if (result.exitCode !== 0 && !/No such container/i.test(result.stderr)) {
+    throw new Error(`Failed to remove sandbox container ${name}: ${result.stderr.trim()}`);
+  }
 }
 
 function sanitizeName(value: string): string {

@@ -43,12 +43,14 @@ export function createAgentToolbox({
   timeoutMs,
   deadline = Date.now() + timeoutMs,
   runCheck,
+  runTool,
 }: {
   workspace: string;
   config: RepoConfig;
   timeoutMs: number;
   deadline?: number;
   runCheck?: (command: string, timeoutMs: number) => Promise<CommandResult>;
+  runTool?: (name: string, input: unknown, timeoutMs: number) => Promise<CommandResult>;
 }): AgentToolbox {
   let mutations = 0;
   const checkResults = new Map<string, boolean>();
@@ -64,6 +66,16 @@ export function createAgentToolbox({
     },
     async execute(name, input) {
       const args = asObject(input);
+
+      if (runTool && name !== "run_check") {
+        const result = await runTool(name, args, remainingTimeout(deadline, timeoutMs));
+        assertCommandSucceeded(result);
+        if (name === "write_file" || name === "replace_in_file") {
+          mutations += 1;
+          checkResults.clear();
+        }
+        return truncate(result.stdout);
+      }
 
       switch (name) {
         case "list_files": {

@@ -1,5 +1,6 @@
 export interface LeaseHeartbeat {
   stop(): Promise<void>;
+  assertActive(): void;
 }
 
 export function startLeaseHeartbeat({
@@ -15,10 +16,14 @@ export function startLeaseHeartbeat({
 }): LeaseHeartbeat {
   const intervalMs = Math.max(minimumIntervalMs, Math.floor(leaseMs / 3));
   let pending: Promise<void> | null = null;
+  let fatalError: unknown = null;
   const timer = setInterval(() => {
-    if (pending) return;
+    if (pending || fatalError) return;
     pending = heartbeat()
-      .catch((error) => onError?.(error))
+      .catch((error) => {
+        fatalError = error;
+        onError?.(error);
+      })
       .finally(() => {
         pending = null;
       });
@@ -29,6 +34,9 @@ export function startLeaseHeartbeat({
     async stop() {
       clearInterval(timer);
       await pending;
+    },
+    assertActive() {
+      if (fatalError) throw fatalError;
     },
   };
 }

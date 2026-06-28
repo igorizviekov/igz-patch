@@ -1,4 +1,4 @@
-import { updateRun, type RunRecord } from "@/lib/db/runs";
+import { updateRun, updateRunWithLease, type RunLease, type RunRecord } from "@/lib/db/runs";
 import type { getInstallationOctokit } from "@/lib/github/app";
 
 export function runCommentMarker(runId: string): string {
@@ -33,11 +33,13 @@ export async function upsertRunStatusComment({
   run,
   headline,
   details,
+  lease,
 }: {
   octokit: Awaited<ReturnType<typeof getInstallationOctokit>>;
   run: RunRecord;
   headline: string;
   details: string[];
+  lease?: RunLease;
 }): Promise<RunRecord> {
   const [owner, repo] = run.repository_full_name.split("/");
   if (!owner || !repo) throw new Error(`Invalid repository name: ${run.repository_full_name}`);
@@ -79,8 +81,9 @@ export async function upsertRunStatusComment({
     commentUrl = response.data.html_url;
   }
 
-  return updateRun(run.id, {
+  const fields = {
     status_comment_id: commentId,
     status_comment_url: commentUrl,
-  });
+  };
+  return lease ? updateRunWithLease(run.id, lease, fields) : updateRun(run.id, fields);
 }

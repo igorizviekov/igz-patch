@@ -8,15 +8,24 @@ import {
   safeExecutionEnvironment,
   type CommandResult,
 } from "@/lib/agent/command";
-import { BlockedRunError, enforceDiffPolicy, readDiffSummary } from "@/lib/agent/diff";
+import { BlockedRunError, enforceDiffPolicy, readBinaryPatch, readDiffSummary } from "@/lib/agent/diff";
+import {
+  gitAuthEnvironment,
+  hardenedGitEnvironment,
+  protectedGitArguments,
+} from "@/lib/agent/git-security";
 import { runConfiguredAgent } from "@/lib/agent/providers";
-import { defaultRepoConfig, type RepoConfig } from "@/lib/agent/repo-config";
+import { defaultRepoConfig, enforceWorkerRepoPolicy, type RepoConfig } from "@/lib/agent/repo-config";
 import { loadRepoConfig } from "@/lib/agent/repo-config-local";
 import { createDockerSandbox, type AgentSandbox } from "@/lib/agent/sandbox";
 import {
   addRunEvent,
+  addRunEventWithLease,
+  assertRunLease,
   isRunCancellationRequested,
-  updateRun,
+  LeaseLostError,
+  updateRunWithLease,
+  type RunLease,
   type RunRecord,
 } from "@/lib/db/runs";
 import { getInstallationOctokit, getInstallationToken } from "@/lib/github/app";
@@ -26,14 +35,33 @@ import { isTransientError, withRetry } from "@/lib/retry";
 
 type InstallationOctokit = Awaited<ReturnType<typeof getInstallationOctokit>>;
 
-export async function executeRun(run: RunRecord): Promise<void> {
+export async function executeRun(
+  run: RunRecord,
+  lease: RunLease,
+  assertHeartbeat: () => void = () => {},
+): Promise<void> {
   let octokit: InstallationOctokit | null = null;
   let currentRun = run;
   let workspace: string | null = null;
+  let trustedWorkspace: string | null = null;
   let config: RepoConfig | null = null;
   let sandbox: AgentSandbox | null = null;
+  let pullRequestUrl: string | null = null;
+  const addEvent = (
+    eventType: string,
+    message: string,
+    metadata: Parameters<typeof addRunEventWithLease>[4] = {},
+  ) => {
+    assertHeartbeat();
+    return addRunEventWithLease(run.id, lease, eventType, message, metadata);
+  };
+  const update = (fields: Parameters<typeof updateRunWithLease>[2]) => {
+    assertHeartbeat();
+    return updateRunWithLease(run.id, lease, fields);
+  };
 
   try {
+    await assertRunActive(run.id, lease, assertHeartbeat);
     octokit = await retryTransient(() => getInstallationOctokit(run.installation_id));
     currentRun = await retryTransient(() =>
       upsertRunStatusComment({
@@ -41,10 +69,11 @@ export async function executeRun(run: RunRecord): Promise<void> {
         run: currentRun,
         headline: "running",
         details: ["Worker claimed the run and is preparing a repository workspace."],
+        lease,
       }),
     );
-    await assertRunActive(run.id);
-    await addRunEvent(run.id, "workspace", "Preparing checkout");
+    await assertRunActive(run.id, lease, assertHeartbeat);
+    await addEvent("workspace", "Preparing untrusted checkout");
     const token = await retryTransient(() => getInstallationToken(run.installation_id));
     workspace = prepareWorkspace(run.id);
 
@@ -58,7 +87,7 @@ export async function executeRun(run: RunRecord): Promise<void> {
     });
 
     config = loadConfigOrBlock(workspace);
-    await assertRunActive(run.id);
+    await assertRunActive(run.id, lease, assertHeartbeat);
     enforceTriggerConfig(run, config);
     if (!config.enabled) throw new BlockedRunError("IgzPatch is disabled by repository config.");
     if (config.issue_scope.requires_acceptance_criteria && !hasAcceptanceCriteria(run.issue_body)) {
@@ -77,7 +106,7 @@ export async function executeRun(run: RunRecord): Promise<void> {
       },
     });
     await sandbox.ensureAvailable();
-    await addRunEvent(run.id, "sandbox", "Docker sandbox is ready", {
+    await addEvent("sandbox", "Docker sandbox is ready", {
       image: config.sandbox.image,
       setup_network: config.sandbox.setup_network,
       run_network: config.sandbox.run_network,
@@ -93,107 +122,149 @@ export async function executeRun(run: RunRecord): Promise<void> {
       safeExecutionEnvironment(),
       remainingTimeout(deadline, 120_000),
     );
-    currentRun = await updateRun(run.id, { branch_name: branchName });
+    currentRun = await update({ branch_name: branchName });
     currentRun = await retryTransient(() =>
       upsertRunStatusComment({
         octokit: requireOctokit(octokit),
         run: currentRun,
         headline: "editing",
         details: ["Repository cloned.", `Branch: \`${branchName}\``],
+        lease,
       }),
     );
 
-    await runSetup(run.id, sandbox, config, deadline);
-    await assertRunActive(run.id);
-    await addRunEvent(run.id, "agent", "Starting configured agent provider", {
+    await runSetup(sandbox, config, deadline, addEvent);
+    await assertRunActive(run.id, lease, assertHeartbeat);
+    await addEvent("agent", "Starting configured agent provider", {
       provider: process.env.IGZPATCH_AGENT_PROVIDER ?? config.routing.primary.provider,
       model: process.env.IGZPATCH_AGENT_MODEL ?? config.routing.primary.model,
     });
-    const agentResult = await runAgent(workspace, currentRun, config, sandbox, deadline);
-    await assertRunActive(run.id);
-    await addRunEvent(run.id, "agent_completed", "Agent provider completed", {
+    const agentResult = await runAgent(workspace, currentRun, config, sandbox, deadline, addEvent);
+    await assertRunActive(run.id, lease, assertHeartbeat);
+    await addEvent("agent_completed", "Agent provider completed", {
       provider: agentResult.provider,
       model: agentResult.model,
       summary: truncateText(redactText(agentResult.summary, config.audit.redact_patterns)),
     });
-    await runChecks(run.id, sandbox, config, deadline);
-    await assertRunActive(run.id);
+    await runChecks(sandbox, config, deadline, addEvent);
+    await assertRunActive(run.id, lease, assertHeartbeat);
     sandbox.cleanupRuntime();
 
     const diffSummary = await readDiffSummary(workspace);
     enforceDiffPolicy(diffSummary, config);
-    await addRunEvent(run.id, "diff", "Diff policy passed", {
+    const patch = await readBinaryPatch(workspace, config.issue_scope.max_patch_bytes);
+    await addEvent("diff", "Untrusted diff policy passed", {
       changed_files: diffSummary.changedFiles,
       added_lines: diffSummary.addedLines,
       deleted_lines: diffSummary.deletedLines,
+      patch_bytes: diffSummary.patchBytes,
     });
 
-    await git(workspace, ["config", "user.name", "IgzPatch"], safeExecutionEnvironment(), remainingTimeout(deadline, 120_000));
+    await sandbox.dispose();
+    sandbox = null;
+    trustedWorkspace = prepareWorkspace(`${run.id}-trusted`);
+    await cloneRepository({
+      token,
+      repositoryFullName: run.repository_full_name,
+      workspace: trustedWorkspace,
+    });
     await git(
-      workspace,
-      ["config", "user.email", "igzpatch[bot]@users.noreply.github.com"],
+      trustedWorkspace,
+      ["checkout", "-b", branchName, `origin/${config.repo.default_branch}`],
       safeExecutionEnvironment(),
       remainingTimeout(deadline, 120_000),
     );
-    await git(workspace, ["add", "-A"], safeExecutionEnvironment(), remainingTimeout(deadline, 120_000));
+    await applyPatch(trustedWorkspace, patch, remainingTimeout(deadline, 120_000));
+    const trustedDiffSummary = await readDiffSummary(trustedWorkspace);
+    enforceDiffPolicy(trustedDiffSummary, config);
+    await addEvent("trusted_patch", "Patch applied to fresh trusted checkout", {
+      changed_files: trustedDiffSummary.changedFiles,
+      patch_bytes: trustedDiffSummary.patchBytes,
+    });
+
+    await git(trustedWorkspace, ["add", "-A"], safeExecutionEnvironment(), remainingTimeout(deadline, 120_000));
     await git(
-      workspace,
-      ["commit", "-m", `IgzPatch: fix issue #${run.issue_number}`],
+      trustedWorkspace,
+      [
+        "-c", "user.name=IgzPatch",
+        "-c", "user.email=igzpatch[bot]@users.noreply.github.com",
+        "commit", "-m", `IgzPatch: fix issue #${run.issue_number}`,
+      ],
       safeExecutionEnvironment(),
       remainingTimeout(deadline, 120_000),
     );
-    const finalWorkspace = workspace;
+    const finalWorkspace = trustedWorkspace;
     const finalConfig = config;
-    await assertRunActive(run.id);
+    await assertRunActive(run.id, lease, assertHeartbeat);
     const pushToken = await retryTransient(() => getInstallationToken(run.installation_id));
     await retryCommand(() =>
       git(
         finalWorkspace,
-        ["push", "--force-with-lease", "origin", branchName],
+        ["push", "--no-verify", "--force-with-lease", "origin", branchName],
         gitAuthEnvironment(pushToken),
         remainingTimeout(deadline, 120_000),
       ),
     );
 
-    await assertRunActive(run.id);
-    const prUrl = await retryTransient(() =>
+    await assertRunActive(run.id, lease, assertHeartbeat);
+    pullRequestUrl = await retryTransient(() =>
       openDraftPullRequest({
         octokit: requireOctokit(octokit),
         run: currentRun,
         branchName,
         baseBranch: finalConfig.repo.default_branch,
         title: finalConfig.pull_request.title_template.replace("#{issue_number}", String(run.issue_number)),
-        body: renderPullRequestBody({ run: currentRun, diffSummary }),
+        body: renderPullRequestBody({ run: currentRun, diffSummary: trustedDiffSummary }),
       }),
     );
 
-    const succeeded = await updateRun(run.id, {
+    const succeeded = await retryTransient(() => update({
       status: "succeeded",
-      pull_request_url: prUrl,
-    });
-    await addRunEvent(run.id, "succeeded", "Opened draft pull request", { pull_request_url: prUrl });
-    await retryTransient(() =>
+      pull_request_url: pullRequestUrl,
+    }));
+    await bestEffort(() => addRunEvent(run.id, "succeeded", "Opened draft pull request", {
+      pull_request_url: pullRequestUrl,
+    }));
+    await bestEffort(() => retryTransient(() =>
       upsertRunStatusComment({
         octokit: requireOctokit(octokit),
         run: succeeded,
         headline: "draft PR opened",
         details: [
-          `PR: ${prUrl}`,
-          `Changed files: ${diffSummary.changedFiles.length}`,
-          `Diff lines: +${diffSummary.addedLines} / -${diffSummary.deletedLines}`,
+          `PR: ${pullRequestUrl}`,
+          `Changed files: ${trustedDiffSummary.changedFiles.length}`,
+          `Diff lines: +${trustedDiffSummary.addedLines} / -${trustedDiffSummary.deletedLines}`,
         ],
       }),
-    );
+    ));
   } catch (error) {
+    if (error instanceof LeaseLostError) return;
     const patterns = config?.audit.redact_patterns ?? defaultRepoConfig.audit.redact_patterns;
     const message = truncateText(redactText(error instanceof Error ? error.message : String(error), patterns));
+    if (pullRequestUrl) {
+      await bestEffort(() => retryTransient(() => update({
+        status: "succeeded",
+        pull_request_url: pullRequestUrl,
+        error_message: null,
+      })));
+      await bestEffort(() => addRunEvent(run.id, "succeeded", "Recovered state after draft PR creation", {
+        pull_request_url: pullRequestUrl,
+      }));
+      return;
+    }
     const retryQueued = !(error instanceof BlockedRunError) && isTransientError(error) && run.attempts < run.max_attempts;
     const status = retryQueued ? "queued" : error instanceof BlockedRunError ? "blocked" : "failed";
-    const updated = await updateRun(run.id, {
-      status,
-      blocked_reason: status === "blocked" ? message : null,
-      error_message: status === "failed" || status === "queued" ? message : null,
-    });
+    let updated: RunRecord;
+    try {
+      updated = await update({
+        status,
+        blocked_reason: status === "blocked" ? message : null,
+        error_message: status === "failed" || status === "queued" ? message : null,
+      });
+    } catch (updateError) {
+      if (updateError instanceof LeaseLostError) return;
+      throw updateError;
+    }
     await addRunEvent(run.id, retryQueued ? "retry_queued" : status, message, {
       attempt: run.attempts,
       max_attempts: run.max_attempts,
@@ -219,6 +290,7 @@ export async function executeRun(run: RunRecord): Promise<void> {
   } finally {
     if (sandbox) await sandbox.dispose();
     if (workspace) rmSync(workspace, { recursive: true, force: true });
+    if (trustedWorkspace) rmSync(trustedWorkspace, { recursive: true, force: true });
   }
 }
 
@@ -241,7 +313,12 @@ async function cloneRepository({
   const cloneUrl = `https://github.com/${repositoryFullName}.git`;
   const result = await runProcess({
     command: "git",
-    args: ["clone", cloneUrl, "."],
+    args: protectedGitArguments([
+      "clone",
+      "--config", "core.hooksPath=/dev/null",
+      cloneUrl,
+      ".",
+    ]),
     displayCommand: `git clone https://github.com/${repositoryFullName}.git .`,
     cwd: workspace,
     timeoutMs: 120_000,
@@ -252,10 +329,10 @@ async function cloneRepository({
 }
 
 async function runSetup(
-  runId: string,
   sandbox: AgentSandbox,
   config: RepoConfig,
   deadline: number,
+  addEvent: RunEventWriter,
 ): Promise<void> {
   for (const command of config.sandbox.setup) {
     const result = await sandbox.runCommand({
@@ -263,7 +340,7 @@ async function runSetup(
       phase: "setup",
       timeoutMs: remainingTimeout(deadline, config.sandbox.timeout_minutes * 60_000),
     });
-    await recordCommandEvent(runId, "setup_command", result, config);
+    await recordCommandEvent("setup_command", result, config, addEvent);
     assertBlockingCommandSucceeded(result, "Setup command failed");
   }
 }
@@ -274,6 +351,7 @@ async function runAgent(
   config: ReturnType<typeof loadRepoConfig>,
   sandbox: AgentSandbox,
   deadline: number,
+  addEvent: RunEventWriter,
 ): ReturnType<typeof runConfiguredAgent> {
   try {
     return await runConfiguredAgent({
@@ -284,8 +362,7 @@ async function runAgent(
       timeoutMs: remainingTimeout(deadline, config.sandbox.timeout_minutes * 60_000),
       onToolEvent: config.audit.store_tool_calls
         ? async (event) => {
-            await addRunEvent(
-              run.id,
+            await addEvent(
               "tool_call",
               `${event.name} ${event.ok ? "completed" : "failed"}`,
               summarizeToolEvent(event, config.audit.redact_patterns),
@@ -294,6 +371,7 @@ async function runAgent(
         : undefined,
     });
   } catch (error) {
+    if (error instanceof LeaseLostError) throw error;
     if (isTransientError(error)) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new BlockedRunError(`Agent provider failed: ${message}`);
@@ -301,10 +379,10 @@ async function runAgent(
 }
 
 async function runChecks(
-  runId: string,
   sandbox: AgentSandbox,
   config: RepoConfig,
   deadline: number,
+  addEvent: RunEventWriter,
 ): Promise<void> {
   for (const command of config.checks.required) {
     const result = await sandbox.runCommand({
@@ -312,7 +390,7 @@ async function runChecks(
       phase: "run",
       timeoutMs: remainingTimeout(deadline, config.sandbox.timeout_minutes * 60_000),
     });
-    await recordCommandEvent(runId, "required_check", result, config);
+    await recordCommandEvent("required_check", result, config, addEvent);
     assertBlockingCommandSucceeded(result, "Required check failed");
   }
 
@@ -322,7 +400,7 @@ async function runChecks(
       phase: "run",
       timeoutMs: remainingTimeout(deadline, config.sandbox.timeout_minutes * 60_000),
     });
-    await recordCommandEvent(runId, "optional_check", result, config);
+    await recordCommandEvent("optional_check", result, config, addEvent);
   }
 }
 
@@ -334,10 +412,10 @@ async function git(
 ): Promise<void> {
   const result = await runProcess({
     command: "git",
-    args,
+    args: protectedGitArguments(args),
     cwd: workspace,
     timeoutMs,
-    env,
+    env: { ...env, ...hardenedGitEnvironment() },
     inheritEnv: false,
   });
   assertCommandSucceeded(result);
@@ -386,7 +464,9 @@ async function openDraftPullRequest({
 
 function loadConfigOrBlock(workspace: string) {
   try {
-    return loadRepoConfig(workspace);
+    const config = loadRepoConfig(workspace);
+    enforceWorkerRepoPolicy(config);
+    return config;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new BlockedRunError(`Repository config validation failed: ${message}`);
@@ -452,33 +532,23 @@ function enforceTriggerConfig(run: RunRecord, config: RepoConfig): void {
   }
 }
 
-function gitAuthEnvironment(token: string): Record<string, string> {
-  return {
-    ...safeExecutionEnvironment(),
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "http.extraHeader",
-    GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
-  };
-}
-
 async function recordCommandEvent(
-  runId: string,
   eventType: string,
   result: CommandResult,
   config: RepoConfig,
+  addEvent: RunEventWriter,
 ): Promise<void> {
   const metadata: Record<string, string | number | boolean | null> = {
     command: result.command,
     exit_code: result.exitCode,
     timed_out: result.timedOut,
+    output_limit_exceeded: Boolean(result.outputLimitExceeded),
   };
   if (config.audit.store_command_logs) {
     metadata.stdout = truncateText(redactText(result.stdout, config.audit.redact_patterns));
     metadata.stderr = truncateText(redactText(result.stderr, config.audit.redact_patterns));
   }
-  await addRunEvent(
-    runId,
+  await addEvent(
     eventType,
     result.exitCode === 0 ? "Command completed" : "Command failed",
     metadata,
@@ -534,8 +604,41 @@ function summarizeToolEvent(
   return metadata;
 }
 
-async function assertRunActive(runId: string): Promise<void> {
+async function assertRunActive(
+  runId: string,
+  lease: RunLease,
+  assertHeartbeat: () => void,
+): Promise<void> {
+  assertHeartbeat();
+  await assertRunLease(runId, lease);
   if (await isRunCancellationRequested(runId)) {
     throw new BlockedRunError("Run was cancelled by a maintainer command.");
   }
 }
+
+async function applyPatch(workspace: string, patch: string, timeoutMs: number): Promise<void> {
+  const result = await runProcess({
+    command: "git",
+    args: protectedGitArguments(["apply", "--whitespace=nowarn", "--"]),
+    displayCommand: "git apply [validated patch]",
+    cwd: workspace,
+    timeoutMs,
+    env: hardenedGitEnvironment(),
+    inheritEnv: false,
+    stdin: patch,
+  });
+  assertCommandSucceeded(result);
+}
+
+async function bestEffort(operation: () => Promise<unknown>): Promise<void> {
+  try {
+    await operation();
+  } catch {
+  }
+}
+
+type RunEventWriter = (
+  eventType: string,
+  message: string,
+  metadata?: Parameters<typeof addRunEventWithLease>[4],
+) => Promise<void>;
