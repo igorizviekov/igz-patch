@@ -1,11 +1,17 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-
 import YAML from "yaml";
 import { z } from "zod";
 
+import type { getInstallationOctokit } from "@/lib/github/app";
+
 export const agentProviderSchema = z.enum(["codex", "openai", "ollama"]);
 export type AgentProvider = z.infer<typeof agentProviderSchema>;
+
+export class RepoConfigValidationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RepoConfigValidationError";
+  }
+}
 
 const repoConfigSchema = z.object({
   version: z.literal(1),
@@ -13,24 +19,24 @@ const repoConfigSchema = z.object({
   triggers: z.object({
     labels: z.array(z.string()).min(1),
     commands: z.array(z.string()).default([]),
-  }),
+  }).strict(),
   repo: z
     .object({
       default_branch: z.string().default("main"),
       language: z.string().default("typescript"),
-    })
+    }).strict()
     .default({}),
   branch: z
     .object({
       prefix: z.string().regex(/^[A-Za-z0-9._/-]+$/).default("igzpatch"),
-    })
+    }).strict()
     .default({}),
   pull_request: z
     .object({
-      draft: z.boolean().default(true),
+      draft: z.literal(true).default(true),
       title_template: z.string().default("IgzPatch: fix issue #{issue_number}"),
       body_policy: z.enum(["evidence_summary"]).default("evidence_summary"),
-    })
+    }).strict()
     .default({}),
   sandbox: z.object({
     image: z.string().default("node:22-bookworm"),
@@ -40,27 +46,27 @@ const repoConfigSchema = z.object({
     memory_mb: z.number().int().positive().default(4096),
     timeout_minutes: z.number().int().positive().default(20),
     setup: z.array(z.string()).default([]),
-  }),
+  }).strict(),
   checks: z.object({
     required: z.array(z.string()).default([]),
     optional: z.array(z.string()).default([]),
-  }),
+  }).strict(),
   paths: z.object({
     allowed: z.array(z.string()).min(1),
     blocked: z.array(z.string()).default([]),
-  }),
+  }).strict(),
   issue_scope: z.object({
     max_files_changed: z.number().int().positive().default(6),
     max_diff_lines: z.number().int().positive().default(300),
     requires_acceptance_criteria: z.boolean().default(true),
-  }),
+  }).strict(),
   agent: z
     .object({
       max_iterations: z.number().int().positive().default(3),
       read_only_first_pass: z.boolean().default(true),
-      open_pr_as_draft: z.boolean().default(true),
-      require_manual_merge: z.boolean().default(true),
-    })
+      open_pr_as_draft: z.literal(true).default(true),
+      require_manual_merge: z.literal(true).default(true),
+    }).strict()
     .refine((agent) => !agent.read_only_first_pass || agent.max_iterations >= 2, {
       message: "max_iterations must be at least 2 when read_only_first_pass is enabled",
       path: ["max_iterations"],
@@ -69,29 +75,29 @@ const repoConfigSchema = z.object({
     primary: z.object({
       provider: agentProviderSchema,
       model: z.string().min(1),
-    }),
-    fallback: z
-      .object({
-        enabled: z.boolean().default(false),
-        provider: agentProviderSchema.default("openai"),
-        model: z.string().min(1).default("gpt-5.4"),
-        conditions: z.array(z.string()).default([]),
-      })
-      .default({}),
-  }),
+    }).strict(),
+  }).strict(),
   audit: z.object({
     comment_strategy: z.literal("marker_backed_single_comment"),
     store_tool_calls: z.boolean().default(true),
     store_command_logs: z.boolean().default(true),
     redact_patterns: z.array(z.string()).default(["sk-", "ghp_", "github_pat_"]),
-  }),
+  }).strict(),
+}).strict().superRefine((config, context) => {
+  if (config.enabled && config.checks.required.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "At least one required check is needed when IgzPatch is enabled",
+      path: ["checks", "required"],
+    });
+  }
 });
 
 export type RepoConfig = z.infer<typeof repoConfigSchema>;
 
 export const defaultRepoConfig: RepoConfig = {
   version: 1,
-  enabled: true,
+  enabled: false,
   triggers: {
     labels: ["igz:fix"],
     commands: ["@IgzPatch fix", "@IgzPatch status", "@IgzPatch stop"],
@@ -141,12 +147,6 @@ export const defaultRepoConfig: RepoConfig = {
       provider: "codex",
       model: "gpt-5.4",
     },
-    fallback: {
-      enabled: false,
-      provider: "openai",
-      model: "gpt-5.4",
-      conditions: [],
-    },
   },
   audit: {
     comment_strategy: "marker_backed_single_comment",
@@ -156,16 +156,44 @@ export const defaultRepoConfig: RepoConfig = {
   },
 };
 
-export function loadRepoConfig(workspace: string): RepoConfig {
-  const configPath =
-    [".igzpatch.yml", ".igzpatch.yaml"].map((name) => join(workspace, name)).find(existsSync) ??
-    null;
+export function parseRepoConfig(source: string): RepoConfig {
+  try {
+    const parsed = YAML.parse(source) as unknown;
+    const merged = deepMerge(defaultRepoConfig, parsed);
+    return repoConfigSchema.parse(merged);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new RepoConfigValidationError(message, { cause: error });
+  }
+}
 
-  if (!configPath) return defaultRepoConfig;
+export async function loadRepoConfigFromGitHub({
+  octokit,
+  owner,
+  repo,
+}: {
+  octokit: Awaited<ReturnType<typeof getInstallationOctokit>>;
+  owner: string;
+  repo: string;
+}): Promise<RepoConfig> {
+  for (const path of [".igzpatch.yml", ".igzpatch.yaml"]) {
+    try {
+      const response = await octokit.repos.getContent({ owner, repo, path });
+      const data = response.data;
+      if (Array.isArray(data) || data.type !== "file" || !("content" in data)) {
+        throw new Error(`${path} is not a regular file`);
+      }
+      if (data.encoding !== "base64" || typeof data.content !== "string") {
+        throw new Error(`${path} must be returned as base64 content`);
+      }
+      return parseRepoConfig(Buffer.from(data.content, "base64").toString("utf8"));
+    } catch (error) {
+      if (isNotFoundError(error)) continue;
+      throw error;
+    }
+  }
 
-  const parsed = YAML.parse(readFileSync(configPath, "utf8")) as unknown;
-  const merged = deepMerge(defaultRepoConfig, parsed);
-  return repoConfigSchema.parse(merged);
+  return defaultRepoConfig;
 }
 
 function deepMerge<T>(base: T, override: unknown): T {
@@ -182,4 +210,8 @@ function deepMerge<T>(base: T, override: unknown): T {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return Boolean(error) && typeof error === "object" && (error as { status?: unknown }).status === 404;
 }

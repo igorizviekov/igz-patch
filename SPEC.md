@@ -4,11 +4,11 @@
 
 IgzPatch is a conservative GitHub issue-to-draft-PR agent. The MVP must work as both a portfolio artifact for the Eigen Labs application and the first slice of a real multi-repository product, while staying small enough to ship quickly.
 
-The application question asks for details or a link to an agent that was built. The strongest answer is not another chat demo. It is a small production-shaped system that shows agent runtime design, orchestration, reliability, observability, cost awareness, external API integration, and bounded autonomy.
+The application question asks for details or a link to an agent that was built. The strongest answer is not another chat demo. It is a small production-shaped system that shows agent runtime design, orchestration, reliability, observability, external API integration, and bounded autonomy.
 
 ## Critical Validation of IDEA.md
 
-The core idea in `IDEA.md` is right: an auditable GitHub issue-to-PR agent is a strong fit for the role. The role values real systems, agent runtimes, reliability, observability, cost control, and developer tools. IgzPatch can demonstrate all of those in a compact product.
+The core idea in `IDEA.md` is right: an auditable GitHub issue-to-PR agent is a strong fit for the role. The role values real systems, agent runtimes, reliability, observability, and developer tools. IgzPatch can demonstrate all of those in a compact product.
 
 The MVP should keep these ideas:
 
@@ -35,16 +35,18 @@ The MVP should change or defer these ideas:
 - Inference: use hosted coding-agent execution first; defer Mac Mini local inference until the product loop is working.
 - Queue: use a plain Supabase Postgres jobs table with polling leases first. It is the best reliability-to-effort tradeoff for this MVP.
 - Contract: include `max_diff_lines`, explicit setup/run network phases, branch naming, PR title/body policy, and fail-closed config validation.
-- Demo: build a separate target repository later with seeded issues and deterministic tests.
+- Worker host: run the MVP worker on the current development machine first; the same process can move to a Mac Mini or VPS without a separate repository.
+- Demo: use the separate [`igzpatch-demo`](https://github.com/igorizviekov/igzpatch-demo) RelayOps incident-board repository with five seeded issues and deterministic tests.
 - Agent provider: support `codex`, `openai`, and `ollama`; select them per repository or with worker-wide environment overrides.
+- Sandbox: run setup, checks, and agent tools inside resource-constrained Docker containers with explicit setup/run network policy.
+- Deferred surfaces: provider fallback and token/cost dashboards are not part of this MVP.
 
 ## Remaining Questions and Gaps
 
-- Worker host: decide whether the MVP worker runs locally, on a small VPS, or on another always-on service.
 - Supabase project: create the database and run `db/schema.sql`.
 - GitHub App setup: create the app, install it only on the demo repo, and add the webhook secret/private key to the deployment.
-- Demo repo content: write the first 3 to 5 seeded bugs, tests, and issue acceptance criteria.
-- Sandbox hardening: move from trusted demo execution to Docker-enforced setup/run network policy before broader third-party use.
+- Deployment: configure the Vercel control plane, public webhook URL, and always-on worker environment.
+- End-to-end proof: label one seeded demo issue and verify the resulting draft PR and status trail.
 
 ## Best Architecture
 
@@ -80,7 +82,7 @@ GitHub issue label/comment
 | Queue | Supabase Postgres job table | Durable, inspectable, low effort, supports polling leases |
 | Worker | Node.js long-running process | No Vercel duration limit; easy local or VPS deployment |
 | Agent execution | Provider router for Codex, OpenAI API, and Ollama | Keeps worker orchestration stable while inference changes |
-| Sandbox | Docker policy in spec, progressive implementation | Required for product safety; can start with trusted demo worker |
+| Sandbox | Docker-enforced setup, provider, and check execution | Resource, filesystem, privilege, network, and timeout boundaries |
 | Dashboard | Server-rendered run table | Minimal visible proof of durability and state |
 | Demo app | Separate GitHub repo | Keeps IgzPatch repo focused on agent/control-plane code |
 
@@ -91,6 +93,7 @@ GitHub issue label/comment
 - Register a GitHub App with minimum permissions.
 - Receive `issues` and `issue_comment` webhooks.
 - Trigger only when a configured label or command is present.
+- Accept issue comment commands only from repository owners, members, or collaborators.
 - Queue one run per GitHub delivery and issue.
 - Let a worker claim jobs with lease/retry semantics.
 - Create or update one marker-backed status comment per run.
@@ -101,7 +104,7 @@ GitHub issue label/comment
 - Push a branch and open a draft PR only when checks and limits pass.
 - Mark blocked with an explicit reason when the run cannot safely produce a PR.
 - Show recent runs in a minimal dashboard.
-- Create a later separate demo repository with seeded bugs and tests.
+- Use a separate demo repository with seeded bugs and deterministic tests.
 
 ### Out of Scope for MVP
 
@@ -113,6 +116,8 @@ GitHub issue label/comment
 - General-purpose issue triage.
 - Support for private package registries beyond user-configured setup commands.
 - Running as a public service for arbitrary third-party repositories.
+- Provider fallback or automatic model failover.
+- Token accounting or cost dashboards.
 
 ## Repository Contract
 
@@ -187,13 +192,6 @@ routing:
   primary:
     provider: codex
     model: gpt-5.4
-  fallback:
-    enabled: false
-    provider: openai
-    model: gpt-5.4
-    conditions:
-      - syntax_repair_failed
-      - context_too_large
 
 audit:
   comment_strategy: marker_backed_single_comment
@@ -257,7 +255,7 @@ The first worker is intentionally simple:
 10. Commit, push, and open a draft PR.
 11. Update the run comment and Postgres status.
 
-Every provider receives the same issue, repository, policy, iteration, and timeout contract. The Codex adapter invokes `codex exec` in non-interactive `workspace-write` mode. The OpenAI Responses API and Ollama adapters share a bounded tool loop whose write tools enforce repository path policy and whose command tool can run only configured required checks. Worker-wide environment overrides make provider changes operational rather than code changes.
+Every provider receives the same issue, repository, policy, iteration, sandbox, and timeout contract. Setup and checks run in the target repository's configured Docker image. The Codex adapter invokes `codex exec` in a pinned provider image and non-interactive `workspace-write` mode. The OpenAI Responses API and Ollama adapters share a bounded tool loop whose write tools enforce repository path policy and whose command tool can run only configured checks. Worker-wide environment overrides make provider changes operational rather than code changes.
 
 ## Blocked Conditions
 
@@ -280,10 +278,10 @@ The worker must stop and mark the run blocked when:
 
 ## Demo Repository Plan
 
-The demo repository should be created separately from this repo. It should contain:
+The demo repository is created separately from this repo. It contains:
 
 - a small TypeScript or Next.js app;
-- 3 to 5 seeded GitHub issues;
+- five seeded GitHub issues covering ordering, operational metrics, SLA boundaries, mobile overflow, and toolbar clipping;
 - one deterministic test failure per issue;
 - a simple `.igzpatch.yml`;
 - a README that explains the expected demonstration flow;
@@ -311,23 +309,22 @@ The first demo issue should be intentionally boring: a small pure function bug w
 
 ### Phase 3: Demo Repository
 
-- Create a separate demo repo.
-- Add `.igzpatch.yml`.
-- Seed issues and deterministic tests.
+- Create a separate demo repo. Complete.
+- Add `.igzpatch.yml`. Complete.
+- Seed issues and deterministic tests. Complete.
 - Install the GitHub App on only that repo.
 - Run one issue through to draft PR.
 
 ### Phase 4: Audit Polish
 
-- Add command log summaries.
-- Add token and cost metadata from the hosted agent.
-- Improve dashboard event timeline.
+- Add command and tool-call summaries. Complete.
+- Improve dashboard event timeline later.
 - Add screenshots or recorded demo.
 
 ### Phase 5: Product Hardening
 
-- Add Docker sandbox execution for setup/checks/agent tools.
-- Add retry policies for transient GitHub and provider failures.
+- Add Docker sandbox execution for setup/checks/agent tools. Complete.
+- Add retry policies for transient GitHub and provider failures. Complete.
 - Add config UI and install state.
 - Add eval fixtures from the demo repo.
 - Consider Supabase Queues/pgmq only if plain polling becomes limiting.

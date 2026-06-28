@@ -1,7 +1,11 @@
 import type { CreateRunInput } from "@/lib/db/runs";
+import type { RepoConfig } from "@/lib/agent/repo-config";
 
-const DEFAULT_TRIGGER_LABEL = "igz:fix";
-const DEFAULT_COMMANDS = ["@igzpatch fix"];
+export interface WebhookRepositoryContext {
+  installationId: number;
+  repositoryId: number;
+  repositoryFullName: string;
+}
 
 interface WebhookPayload {
   action?: string;
@@ -22,6 +26,7 @@ interface WebhookPayload {
   comment?: {
     body?: string;
     user?: { login?: string };
+    author_association?: string;
   };
   sender?: { login?: string };
 }
@@ -30,10 +35,12 @@ export function runInputFromWebhook({
   eventName,
   deliveryId,
   payload,
+  triggers,
 }: {
   eventName: string;
   deliveryId: string;
   payload: WebhookPayload;
+  triggers: RepoConfig["triggers"];
 }): CreateRunInput | null {
   if (eventName !== "issues" && eventName !== "issue_comment") return null;
   if (!payload.issue || payload.issue.pull_request) return null;
@@ -50,7 +57,9 @@ export function runInputFromWebhook({
     return null;
   }
 
-  if (eventName === "issues" && issueEventTriggersRun(payload)) {
+  if (eventName === "issues") {
+    const label = issueEventTrigger(payload, triggers.labels);
+    if (!label) return null;
     return {
       githubDeliveryId: deliveryId,
       installationId,
@@ -61,11 +70,14 @@ export function runInputFromWebhook({
       issueBody,
       issueUrl,
       triggerKind: `issues.${payload.action ?? "unknown"}`,
+      triggerValue: label,
       triggerActor: payload.sender?.login ?? null,
     };
   }
 
-  if (eventName === "issue_comment" && issueCommentTriggersRun(payload)) {
+  if (eventName === "issue_comment") {
+    const command = issueCommentTrigger(payload, triggers.commands);
+    if (!command || commandAction(command) !== "fix") return null;
     return {
       githubDeliveryId: deliveryId,
       installationId,
@@ -76,6 +88,7 @@ export function runInputFromWebhook({
       issueBody,
       issueUrl,
       triggerKind: "issue_comment.command",
+      triggerValue: command,
       triggerActor: payload.comment?.user?.login ?? payload.sender?.login ?? null,
     };
   }
@@ -83,18 +96,54 @@ export function runInputFromWebhook({
   return null;
 }
 
-function issueEventTriggersRun(payload: WebhookPayload): boolean {
-  if (!["opened", "reopened", "edited", "labeled"].includes(payload.action ?? "")) return false;
-  if (payload.action === "labeled") {
-    return normalize(payload.label?.name) === DEFAULT_TRIGGER_LABEL;
-  }
-  return payload.issue?.labels?.some((label) => normalize(label.name) === DEFAULT_TRIGGER_LABEL) ?? false;
+export function webhookRepositoryContext(payload: WebhookPayload): WebhookRepositoryContext | null {
+  const installationId = payload.installation?.id;
+  const repositoryId = payload.repository?.id;
+  const repositoryFullName = payload.repository?.full_name;
+  if (!installationId || !repositoryId || !repositoryFullName) return null;
+  return { installationId, repositoryId, repositoryFullName };
 }
 
-function issueCommentTriggersRun(payload: WebhookPayload): boolean {
-  if (payload.action !== "created") return false;
-  const body = normalize(payload.comment?.body);
-  return DEFAULT_COMMANDS.some((command) => body.includes(command));
+export function configuredIssueCommand(
+  payload: WebhookPayload,
+  commands: string[],
+): { command: string; action: "fix" | "status" | "stop" } | null {
+  const command = issueCommentTrigger(payload, commands);
+  if (!command) return null;
+  return { command, action: commandAction(command) };
+}
+
+function issueEventTrigger(payload: WebhookPayload, labels: string[]): string | null {
+  if (!["opened", "reopened", "edited", "labeled"].includes(payload.action ?? "")) return null;
+  const configuredLabels = new Map(labels.map((label) => [normalize(label), label]));
+  if (payload.action === "labeled") {
+    return configuredLabels.get(normalize(payload.label?.name)) ?? null;
+  }
+  for (const label of payload.issue?.labels ?? []) {
+    const configured = configuredLabels.get(normalize(label.name));
+    if (configured) return configured;
+  }
+  return null;
+}
+
+function issueCommentTrigger(payload: WebhookPayload, commands: string[]): string | null {
+  if (payload.action !== "created") return null;
+  if (!isMaintainerAssociation(payload.comment?.author_association)) return null;
+  const lines = String(payload.comment?.body ?? "")
+    .split(/\r?\n/)
+    .map(normalize)
+    .filter(Boolean);
+  return commands.find((command) => lines.includes(normalize(command))) ?? null;
+}
+
+function isMaintainerAssociation(value: unknown): boolean {
+  return ["OWNER", "MEMBER", "COLLABORATOR"].includes(String(value ?? "").toUpperCase());
+}
+
+function commandAction(command: string): "fix" | "status" | "stop" {
+  const action = normalize(command).split(/\s+/).at(-1);
+  if (action === "status" || action === "stop") return action;
+  return "fix";
 }
 
 function normalize(value: unknown): string {

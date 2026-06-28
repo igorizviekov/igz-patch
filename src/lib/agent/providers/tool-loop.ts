@@ -11,12 +11,19 @@ export async function runToolAgent({
   toolbox,
   maxIterations,
   readOnlyFirstPass,
+  onToolEvent,
 }: {
   session: AgentModelSession;
   prompt: string;
   toolbox: AgentToolbox;
   maxIterations: number;
   readOnlyFirstPass: boolean;
+  onToolEvent?: (event: {
+    name: string;
+    arguments: unknown;
+    output: string;
+    ok: boolean;
+  }) => Promise<void>;
 }): Promise<string> {
   let inputs: ModelInput[] = [{ type: "user", content: prompt }];
   let lastContent = "";
@@ -28,12 +35,15 @@ export async function runToolAgent({
     lastContent = turn.content.trim() || lastContent;
 
     if (turn.toolCalls.length === 0) {
-      if (toolbox.mutationCount > 0) return lastContent || "Patch completed.";
+      if (toolbox.mutationCount > 0 && toolbox.requiredChecksPassed) {
+        return lastContent || "Patch completed.";
+      }
       inputs = [
         {
           type: "user",
-          content:
-            "No repository changes have been made. Inspect the repository with tools, then implement the requested patch before finishing.",
+          content: toolbox.mutationCount === 0
+            ? "No repository changes have been made. Inspect the repository with tools, then implement the requested patch before finishing."
+            : "The patch is not yet verified. Run every configured required check, inspect failures, and repair the code before finishing.",
         },
       ];
       continue;
@@ -43,9 +53,21 @@ export async function runToolAgent({
     for (const call of turn.toolCalls) {
       try {
         const output = await toolbox.execute(call.name, call.arguments);
+        await onToolEvent?.({
+          name: call.name,
+          arguments: call.arguments,
+          output,
+          ok: true,
+        });
         inputs.push({ type: "tool_result", callId: call.id, name: call.name, output });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        await onToolEvent?.({
+          name: call.name,
+          arguments: call.arguments,
+          output: message,
+          ok: false,
+        });
         inputs.push({
           type: "tool_result",
           callId: call.id,
@@ -58,6 +80,9 @@ export async function runToolAgent({
 
   if (toolbox.mutationCount === 0) {
     throw new Error(`Agent exhausted ${maxIterations} iterations without changing repository files.`);
+  }
+  if (!toolbox.requiredChecksPassed) {
+    throw new Error(`Agent exhausted ${maxIterations} iterations without passing every required check.`);
   }
 
   return lastContent || "Patch completed.";

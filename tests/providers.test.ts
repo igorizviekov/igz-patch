@@ -12,7 +12,8 @@ import { runOllamaAgent } from "@/lib/agent/providers/ollama";
 import { runOpenAiAgent } from "@/lib/agent/providers/openai";
 import { createAgentToolbox } from "@/lib/agent/providers/tools";
 import type { AgentProviderRequest } from "@/lib/agent/providers/types";
-import { defaultRepoConfig, loadRepoConfig, type RepoConfig } from "@/lib/agent/repo-config";
+import { defaultRepoConfig, type RepoConfig } from "@/lib/agent/repo-config";
+import { loadRepoConfig } from "@/lib/agent/repo-config-local";
 
 test("repo config validates supported providers", () => {
   withWorkspace((workspace) => {
@@ -29,7 +30,24 @@ test("repo config validates supported providers", () => {
 
     const config = loadRepoConfig(workspace);
     assert.deepEqual(config.routing.primary, { provider: "ollama", model: "qwen3-coder" });
-    assert.equal(config.routing.fallback.provider, "openai");
+  });
+});
+
+test("repo config rejects unknown policy fields", () => {
+  withWorkspace((workspace) => {
+    writeFileSync(
+      join(workspace, ".igzpatch.yml"),
+      [
+        "version: 1",
+        "routing:",
+        "  primary:",
+        "    provider: codex",
+        "    model: gpt-5.4",
+        "    fallback: openai",
+      ].join("\n"),
+    );
+
+    assert.throws(() => loadRepoConfig(workspace), /Unrecognized key/);
   });
 });
 
@@ -47,6 +65,21 @@ test("repo config rejects an unknown provider", () => {
     );
 
     assert.throws(() => loadRepoConfig(workspace), /Invalid enum value/);
+  });
+});
+
+test("enabled repositories must configure at least one deterministic check", () => {
+  withWorkspace((workspace) => {
+    writeFileSync(
+      join(workspace, ".igzpatch.yml"),
+      [
+        "version: 1",
+        "enabled: true",
+        "checks:",
+        "  required: []",
+      ].join("\n"),
+    );
+    assert.throws(() => loadRepoConfig(workspace), /At least one required check/);
   });
 });
 
@@ -98,6 +131,26 @@ test("toolbox enforces writable and blocked path policies", async () => {
   });
 });
 
+test("toolbox invalidates required checks after every mutation", async () => {
+  await withWorkspaceAsync(async (workspace) => {
+    mkdirSync(join(workspace, "src"));
+    writeFileSync(join(workspace, "src", "value.ts"), "export const value = 1;\n");
+    const config = makeConfig({ provider: "openai", model: "gpt-5.4" });
+    config.checks.required = ["true"];
+    const toolbox = createAgentToolbox({ workspace, config, timeoutMs: 5_000 });
+
+    assert.equal(toolbox.requiredChecksPassed, false);
+    await toolbox.execute("run_check", { command: "true" });
+    assert.equal(toolbox.requiredChecksPassed, true);
+    await toolbox.execute("replace_in_file", {
+      path: "src/value.ts",
+      old_text: "value = 1",
+      new_text: "value = 2",
+    });
+    assert.equal(toolbox.requiredChecksPassed, false);
+  });
+});
+
 test("diff summary includes newly created files and paths containing spaces", async () => {
   await withWorkspaceAsync(async (workspace) => {
     execFileSync("git", ["init"], { cwd: workspace, stdio: "ignore" });
@@ -139,8 +192,13 @@ test("OpenAI provider performs a read-only pass then edits through Responses API
       return response;
     }) as typeof fetch;
 
+    const request = makeRequest(workspace, { provider: "openai", model: "gpt-5.4" });
+    const toolEvents: string[] = [];
+    request.onToolEvent = async (event) => {
+      toolEvents.push(`${event.name}:${event.ok}`);
+    };
     const summary = await runOpenAiAgent(
-      makeRequest(workspace, { provider: "openai", model: "gpt-5.4" }),
+      request,
       { provider: "openai", model: "gpt-5.4" },
       { fetchImpl, env: { OPENAI_API_KEY: "test-key" } },
     );
@@ -150,6 +208,7 @@ test("OpenAI provider performs a read-only pass then edits through Responses API
     assert.deepEqual(toolNames(requests[0]), ["get_diff", "list_files", "read_file", "search_files"]);
     assert.ok(toolNames(requests[1]).includes("replace_in_file"));
     assert.equal(requests[1]?.previous_response_id, "resp-1");
+    assert.deepEqual(toolEvents, ["read_file:true", "replace_in_file:true"]);
   });
 });
 
@@ -223,6 +282,45 @@ test("Codex provider invokes non-interactive workspace-write mode with prompt on
     assert.ok(invocation?.args?.includes("workspace-write"));
     assert.ok(invocation?.args?.includes("gpt-5.4"));
     assert.match(invocation?.stdin ?? "", /Issue: #42 Fix the value/);
+  });
+});
+
+test("Codex provider delegates execution to the configured Docker sandbox", async () => {
+  await withWorkspaceAsync(async (workspace) => {
+    const request = makeRequest(workspace, { provider: "codex", model: "gpt-5.4" });
+    let sandboxInput: { model: string; prompt: string; timeoutMs: number } | undefined;
+    request.sandbox = {
+      ensureAvailable: async () => {},
+      runCommand: async () => {
+        throw new Error("Unexpected command call");
+      },
+      runCodex: async (input) => {
+        sandboxInput = input;
+        return {
+          command: "docker run [Codex provider]",
+          exitCode: 0,
+          stdout: "Container patch complete.\n",
+          stderr: "",
+          timedOut: false,
+        };
+      },
+      cleanupRuntime: () => {},
+      dispose: async () => {},
+    };
+
+    const summary = await runCodexAgent(
+      request,
+      { provider: "codex", model: "gpt-5.4" },
+      {
+        runProcessImpl: async () => {
+          throw new Error("Host Codex must not run");
+        },
+      },
+    );
+
+    assert.equal(summary, "Container patch complete.");
+    assert.equal(sandboxInput?.model, "gpt-5.4");
+    assert.match(sandboxInput?.prompt ?? "", /Issue: #42 Fix the value/);
   });
 });
 

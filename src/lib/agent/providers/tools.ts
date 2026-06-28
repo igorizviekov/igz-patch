@@ -14,17 +14,26 @@ import {
   runProcess,
   runShellCommand,
   safeExecutionEnvironment,
+  type CommandResult,
 } from "@/lib/agent/command";
 import type { RepoConfig } from "@/lib/agent/repo-config";
 import type { AgentToolDefinition } from "@/lib/agent/providers/types";
 
 const maxToolOutput = 30_000;
-const ignoredDirectories = new Set([".git", ".next", "coverage", "dist", "node_modules"]);
+const ignoredDirectories = new Set([
+  ".git",
+  ".igzpatch-runtime",
+  ".next",
+  "coverage",
+  "dist",
+  "node_modules",
+]);
 const sensitiveFileNames = new Set([".netrc", ".npmrc", ".pypirc"]);
 
 export interface AgentToolbox {
   definitions: AgentToolDefinition[];
   readonly mutationCount: number;
+  readonly requiredChecksPassed: boolean;
   execute(name: string, input: unknown): Promise<string>;
 }
 
@@ -33,19 +42,25 @@ export function createAgentToolbox({
   config,
   timeoutMs,
   deadline = Date.now() + timeoutMs,
+  runCheck,
 }: {
   workspace: string;
   config: RepoConfig;
   timeoutMs: number;
   deadline?: number;
+  runCheck?: (command: string, timeoutMs: number) => Promise<CommandResult>;
 }): AgentToolbox {
   let mutations = 0;
+  const checkResults = new Map<string, boolean>();
   const definitions = createToolDefinitions(config.checks.required);
 
   return {
     definitions,
     get mutationCount() {
       return mutations;
+    },
+    get requiredChecksPassed() {
+      return config.checks.required.every((command) => checkResults.get(command) === true);
     },
     async execute(name, input) {
       const args = asObject(input);
@@ -113,6 +128,7 @@ export function createAgentToolbox({
           mkdirSync(dirname(absolutePath), { recursive: true });
           writeFileSync(absolutePath, content, "utf8");
           mutations += 1;
+          checkResults.clear();
           return JSON.stringify({ ok: true, path, bytes: Buffer.byteLength(content) });
         }
         case "replace_in_file": {
@@ -133,6 +149,7 @@ export function createAgentToolbox({
             "utf8",
           );
           mutations += 1;
+          checkResults.clear();
           return JSON.stringify({ ok: true, path });
         }
         case "run_check": {
@@ -140,13 +157,17 @@ export function createAgentToolbox({
           if (!config.checks.required.includes(command)) {
             throw new Error("Only configured required checks may be run");
           }
-          const result = await runShellCommand({
-            command,
-            cwd: workspace,
-            timeoutMs: remainingTimeout(deadline, timeoutMs),
-            env: safeExecutionEnvironment(),
-            inheritEnv: false,
-          });
+          const checkTimeout = remainingTimeout(deadline, timeoutMs);
+          const result = runCheck
+            ? await runCheck(command, checkTimeout)
+            : await runShellCommand({
+                command,
+                cwd: workspace,
+                timeoutMs: checkTimeout,
+                env: safeExecutionEnvironment(),
+                inheritEnv: false,
+              });
+          checkResults.set(command, result.exitCode === 0);
           return truncate(
             JSON.stringify({
               ok: result.exitCode === 0,
