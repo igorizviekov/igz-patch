@@ -35,6 +35,7 @@ export interface AgentToolbox {
   requiredCheckCommands: readonly string[];
   readonly mutationCount: number;
   readonly requiredChecksPassed: boolean;
+  runRequiredCheck(command: string): Promise<CommandResult>;
   execute(name: string, input: unknown): Promise<string>;
 }
 
@@ -55,8 +56,25 @@ export function createAgentToolbox({
 }): AgentToolbox {
   let mutations = 0;
   const checkResults = new Map<string, boolean>();
-  const definitions = createToolDefinitions(config.checks.required);
+  const definitions = createToolDefinitions();
   const requiredCheckCommands = [...config.checks.required];
+  const runRequiredCheck = async (command: string): Promise<CommandResult> => {
+    if (!requiredCheckCommands.includes(command)) {
+      throw new Error("Only configured required checks may be run");
+    }
+    const checkTimeout = remainingTimeout(deadline, timeoutMs);
+    const result = runCheck
+      ? await runCheck(command, checkTimeout)
+      : await runShellCommand({
+          command,
+          cwd: workspace,
+          timeoutMs: checkTimeout,
+          env: safeExecutionEnvironment(),
+          inheritEnv: false,
+        });
+    checkResults.set(command, result.exitCode === 0 && !result.timedOut && !result.outputLimitExceeded);
+    return result;
+  };
 
   return {
     definitions,
@@ -67,10 +85,11 @@ export function createAgentToolbox({
     get requiredChecksPassed() {
       return config.checks.required.every((command) => checkResults.get(command) === true);
     },
+    runRequiredCheck,
     async execute(name, input) {
       const args = asObject(input);
 
-      if (runTool && name !== "run_check") {
+      if (runTool) {
         const result = await runTool(name, args, remainingTimeout(deadline, timeoutMs));
         assertCommandSucceeded(result);
         if (name === "write_file" || name === "replace_in_file") {
@@ -167,32 +186,6 @@ export function createAgentToolbox({
           checkResults.clear();
           return JSON.stringify({ ok: true, path });
         }
-        case "run_check": {
-          const command = requiredString(args.command, "command");
-          if (!config.checks.required.includes(command)) {
-            throw new Error("Only configured required checks may be run");
-          }
-          const checkTimeout = remainingTimeout(deadline, timeoutMs);
-          const result = runCheck
-            ? await runCheck(command, checkTimeout)
-            : await runShellCommand({
-                command,
-                cwd: workspace,
-                timeoutMs: checkTimeout,
-                env: safeExecutionEnvironment(),
-                inheritEnv: false,
-              });
-          checkResults.set(command, result.exitCode === 0);
-          return truncate(
-            JSON.stringify({
-              ok: result.exitCode === 0,
-              exit_code: result.exitCode,
-              timed_out: result.timedOut,
-              stdout: truncate(result.stdout, 12_000),
-              stderr: truncate(result.stderr, 12_000),
-            }),
-          );
-        }
         default:
           throw new Error(`Unknown agent tool: ${name}`);
       }
@@ -200,7 +193,7 @@ export function createAgentToolbox({
   };
 }
 
-function createToolDefinitions(requiredChecks: string[]): AgentToolDefinition[] {
+function createToolDefinitions(): AgentToolDefinition[] {
   const tools: AgentToolDefinition[] = [
     {
       name: "list_files",
@@ -259,18 +252,6 @@ function createToolDefinitions(requiredChecks: string[]): AgentToolDefinition[] 
       readOnly: false,
     },
   ];
-
-  if (requiredChecks.length > 0) {
-    tools.push({
-      name: "run_check",
-      description: "Run one of the repository's configured required checks.",
-      parameters: objectSchema(
-        { command: { type: "string", enum: requiredChecks } },
-        ["command"],
-      ),
-      readOnly: false,
-    });
-  }
 
   return tools;
 }

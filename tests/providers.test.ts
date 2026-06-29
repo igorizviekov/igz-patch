@@ -14,6 +14,7 @@ import { createAgentToolbox } from "@/lib/agent/providers/tools";
 import type { AgentProviderRequest } from "@/lib/agent/providers/types";
 import { defaultRepoConfig, enforceWorkerRepoPolicy, type RepoConfig } from "@/lib/agent/repo-config";
 import { loadRepoConfig } from "@/lib/agent/repo-config-local";
+import { runWorkerChecks } from "@/lib/agent/verification";
 
 test("repo config validates supported providers", () => {
   withWorkspace((workspace) => {
@@ -40,17 +41,19 @@ test("repo config defaults and validates the read-turn budget", () => {
       [
         "version: 1",
         "agent:",
-        "  max_iterations: 2",
+        "  max_iterations: 1",
       ].join("\n"),
     );
-    assert.equal(loadRepoConfig(workspace).agent.max_read_turns, 12);
+    const config = loadRepoConfig(workspace);
+    assert.equal(config.agent.max_iterations, 1);
+    assert.equal(config.agent.max_read_turns, 12);
 
     writeFileSync(
       join(workspace, ".igzpatch.yml"),
       [
         "version: 1",
         "agent:",
-        "  max_iterations: 2",
+        "  max_iterations: 1",
         "  max_read_turns: 0",
       ].join("\n"),
     );
@@ -177,7 +180,7 @@ test("toolbox invalidates required checks after every mutation", async () => {
     const toolbox = createAgentToolbox({ workspace, config, timeoutMs: 5_000 });
 
     assert.equal(toolbox.requiredChecksPassed, false);
-    await toolbox.execute("run_check", { command: "true" });
+    await toolbox.runRequiredCheck("true");
     assert.equal(toolbox.requiredChecksPassed, true);
     await toolbox.execute("replace_in_file", {
       path: "src/value.ts",
@@ -186,6 +189,33 @@ test("toolbox invalidates required checks after every mutation", async () => {
     });
     assert.equal(toolbox.requiredChecksPassed, false);
   });
+});
+
+test("worker verification uses one shared fail-fast policy", async () => {
+  const commands: string[] = [];
+  const events: boolean[] = [];
+  const report = await runWorkerChecks({
+    commands: ["npm test", "npm run build"],
+    execute: async (command) => {
+      commands.push(command);
+      return {
+        command,
+        exitCode: 1,
+        stdout: "Focused test failed.",
+        stderr: "",
+        timedOut: false,
+      };
+    },
+    eventName: "required_check",
+    onToolEvent: async (event) => {
+      events.push(event.ok);
+    },
+  });
+
+  assert.equal(report.passed, false);
+  assert.deepEqual(commands, ["npm test"]);
+  assert.deepEqual(events, [false]);
+  assert.match(report.checks[0]?.output ?? "", /Focused test failed/);
 });
 
 test("diff summary includes newly created files and paths containing spaces", async () => {
@@ -440,7 +470,7 @@ test("OpenAI provider feeds worker-controlled check failures back for repair", a
       { exitCode: 0, stdout: "Tests passed." },
     ];
     const request = makeRequest(workspace, { provider: "openai", model: "gpt-5.5" });
-    request.config.agent.max_iterations = 5;
+    request.config.agent.max_iterations = 2;
     request.config.checks.required = ["npm test"];
     request.sandbox = {
       ensureAvailable: async () => {},
@@ -479,6 +509,7 @@ test("OpenAI provider feeds worker-controlled check failures back for repair", a
     assert.equal(checkResults.length, 0);
     assert.match(JSON.stringify(requests[3]?.input), /Expected value 3 but received 2/);
     assert.match(JSON.stringify(requests[3]?.input), /untrusted diagnostics/);
+    assert.deepEqual(toolNames(requests[4]), []);
   });
 });
 
@@ -615,7 +646,7 @@ test("Codex provider delegates execution to the configured Docker sandbox", asyn
 test("Codex provider repairs failed worker-controlled checks within max iterations", async () => {
   await withWorkspaceAsync(async (workspace) => {
     const request = makeRequest(workspace, { provider: "codex", model: "gpt-5.4" });
-    request.config.agent.max_iterations = 4;
+    request.config.agent.max_iterations = 2;
     request.config.checks.required = ["npm test"];
     const sandboxInputs: Array<{ prompt: string; readOnly: boolean }> = [];
     const checkEvents: boolean[] = [];

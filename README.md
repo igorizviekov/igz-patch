@@ -39,9 +39,7 @@ The worker can override both values with `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH
 | `codex`  | Built `IGZPATCH_CODEX_IMAGE`        | `CODEX_API_KEY`  |
 | `openai` | Network access to the Responses API | `OPENAI_API_KEY` |
 
-OpenAI uses a bounded file-tool loop with separate read/discovery and edit/verification budgets, while the worker runs required checks when the model finishes or exhausts its action budget and feeds failures back for repair.
-
-Codex runs non-interactively in `workspace-write` mode; model-generated shell commands have network disabled even though the Codex process can reach the API. Local-model support and provider fallback are intentionally deferred.
+Both providers use the same worker-controlled verification and repair policy, and `max_iterations` consistently limits writable patch/check attempts. Codex delegates repository inspection and editing to the sandboxed Codex CLI; OpenAI uses an application-managed bounded file-tool loop with a separate read-turn guard. Model-generated commands run without network access. Local-model support and provider fallback are intentionally deferred.
 
 Every provider returns a normalized change summary. IgzPatch uses that same concise subject for the commit and draft PR title, and records the selected provider and model in the issue comment and PR audit section.
 

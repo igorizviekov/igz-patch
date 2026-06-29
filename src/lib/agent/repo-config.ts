@@ -69,11 +69,7 @@ const repoConfigSchema = z.object({
       read_only_first_pass: z.boolean().default(true),
       open_pr_as_draft: z.literal(true).default(true),
       require_manual_merge: z.literal(true).default(true),
-    }).strict()
-    .refine((agent) => !agent.read_only_first_pass || agent.max_iterations >= 2, {
-      message: "max_iterations must be at least 2 when read_only_first_pass is enabled",
-      path: ["max_iterations"],
-    }),
+    }).strict(),
   routing: z.object({
     primary: z.object({
       provider: agentProviderSchema,
