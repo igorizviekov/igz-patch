@@ -9,7 +9,6 @@ import { runCodexAgent } from "@/lib/agent/providers/codex";
 import { enforceDiffPolicy, readDiffSummary } from "@/lib/agent/diff";
 import { protectedGitArguments } from "@/lib/agent/git-security";
 import { resolveAgentProvider } from "@/lib/agent/providers";
-import { runOllamaAgent } from "@/lib/agent/providers/ollama";
 import { runOpenAiAgent } from "@/lib/agent/providers/openai";
 import { createAgentToolbox } from "@/lib/agent/providers/tools";
 import type { AgentProviderRequest } from "@/lib/agent/providers/types";
@@ -24,13 +23,13 @@ test("repo config validates supported providers", () => {
         "version: 1",
         "routing:",
         "  primary:",
-        "    provider: ollama",
-        "    model: qwen3-coder",
+        "    provider: openai",
+        "    model: gpt-5.5",
       ].join("\n"),
     );
 
     const config = loadRepoConfig(workspace);
-    assert.deepEqual(config.routing.primary, { provider: "ollama", model: "qwen3-coder" });
+    assert.deepEqual(config.routing.primary, { provider: "openai", model: "gpt-5.5" });
   });
 });
 
@@ -77,7 +76,7 @@ test("repo config rejects unknown policy fields", () => {
   });
 });
 
-test("repo config rejects an unknown provider", () => {
+test("repo config rejects the removed Ollama provider", () => {
   withWorkspace((workspace) => {
     writeFileSync(
       join(workspace, ".igzpatch.yml"),
@@ -85,8 +84,8 @@ test("repo config rejects an unknown provider", () => {
         "version: 1",
         "routing:",
         "  primary:",
-        "    provider: mystery",
-        "    model: unknown",
+        "    provider: ollama",
+        "    model: qwen3-coder",
       ].join("\n"),
     );
 
@@ -126,9 +125,9 @@ test("worker environment can override repository provider routing", () => {
   assert.deepEqual(
     resolveAgentProvider(
       { config },
-      { IGZPATCH_AGENT_PROVIDER: "ollama", IGZPATCH_AGENT_MODEL: "qwen3-coder" },
+      { IGZPATCH_AGENT_PROVIDER: "openai", IGZPATCH_AGENT_MODEL: "gpt-5.5" },
     ),
-    { provider: "ollama", model: "qwen3-coder" },
+    { provider: "openai", model: "gpt-5.5" },
   );
   assert.throws(
     () => resolveAgentProvider({ config }, { IGZPATCH_AGENT_PROVIDER: "invalid" }),
@@ -529,50 +528,6 @@ test("OpenAI provider stops after the configured read-turn budget", async () => 
   });
 });
 
-test("Ollama provider performs the same bounded tool loop", async () => {
-  await withWorkspaceAsync(async (workspace) => {
-    mkdirSync(join(workspace, "src"));
-    writeFileSync(join(workspace, "src", "value.ts"), "export const value = 1;\n");
-    const urls: string[] = [];
-    const requests: Array<Record<string, unknown>> = [];
-    const responses = [
-      ollamaResponse("read_file", { path: "src/value.ts" }),
-      ollamaResponse("replace_in_file", {
-        path: "src/value.ts",
-        old_text: "value = 1",
-        new_text: "value = 3",
-      }),
-      new Response(JSON.stringify({ message: { role: "assistant", content: "Done." } }), {
-        status: 200,
-      }),
-    ];
-    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-      urls.push(String(input));
-      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-      const response = responses.shift();
-      if (!response) throw new Error("Unexpected Ollama request");
-      return response;
-    }) as typeof fetch;
-
-    const summary = await runOllamaAgent(
-      makeRequest(workspace, { provider: "ollama", model: "qwen3-coder" }),
-      { provider: "ollama", model: "qwen3-coder" },
-      { fetchImpl, env: { OLLAMA_BASE_URL: "http://localhost:11434" } },
-    );
-
-    assert.equal(summary, "Done.");
-    assert.equal(urls[0], "http://localhost:11434/api/chat");
-    assert.match(readFileSync(join(workspace, "src", "value.ts"), "utf8"), /value = 3/);
-    assert.deepEqual(toolNames(requests[0], true), [
-      "get_diff",
-      "list_files",
-      "read_file",
-      "search_files",
-    ]);
-    assert.ok(toolNames(requests[1], true).includes("write_file"));
-  });
-});
-
 test("Codex provider invokes non-interactive workspace-write mode with prompt on stdin", async () => {
   await withWorkspaceAsync(async (workspace) => {
     let invocation: Parameters<typeof import("@/lib/agent/command").runProcess>[0] | undefined;
@@ -795,27 +750,10 @@ function openAiMessageResponse(id: string, outputText: string): Response {
   );
 }
 
-function ollamaResponse(name: string, args: Record<string, unknown>): Response {
-  return new Response(
-    JSON.stringify({
-      message: {
-        role: "assistant",
-        content: "",
-        tool_calls: [{ function: { name, arguments: args } }],
-      },
-    }),
-    { status: 200 },
-  );
-}
-
-function toolNames(body: Record<string, unknown> | undefined, ollama = false): string[] {
+function toolNames(body: Record<string, unknown> | undefined): string[] {
   const tools = (body?.tools ?? []) as Array<Record<string, unknown>>;
   return tools
-    .map((tool) =>
-      ollama
-        ? String((tool.function as Record<string, unknown> | undefined)?.name)
-        : String(tool.name),
-    )
+    .map((tool) => String(tool.name))
     .sort();
 }
 
