@@ -1,5 +1,7 @@
 import { listRecentRuns } from "@/lib/db/runs";
 
+export const dynamic = "force-dynamic";
+
 export default async function Home() {
   let runs: Awaited<ReturnType<typeof listRecentRuns>> = [];
   let setupMessage: string | null = null;
