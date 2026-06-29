@@ -1,8 +1,8 @@
 # IgzPatch
 
-Bounded, auditable issue-to-draft-PR automation.
+Bounded, auditable issue-to-draft-PR AI automation.
 
-IgzPatch turns an explicitly labeled GitHub issue into a small draft pull request. A Next.js control plane verifies webhooks and queues durable runs; a long-running worker leases each run, clones the target repository, invokes a configurable coding agent inside Docker, runs deterministic checks, enforces repository policy, and opens a draft PR.
+IgzPatch agent turns labeled GitHub issue into a draft pull request. A Next.js control plane verifies webhooks and queues durable runs; a long-running worker leases each run, clones the target repository, invokes a configurable coding agent inside Docker, runs deterministic checks, enforces repository policy, and opens a draft PR.
 
 ## Safety Model
 
@@ -30,13 +30,15 @@ routing:
 
 The worker can override both values with `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH_AGENT_MODEL`.
 
-| Provider | Runtime requirement | Authentication |
-| --- | --- | --- |
-| `codex` | Built `IGZPATCH_CODEX_IMAGE` | `CODEX_API_KEY` |
-| `openai` | Network access to the Responses API | `OPENAI_API_KEY` |
-| `ollama` | Reachable Ollama server and model | Optional `OLLAMA_API_KEY` |
+| Provider | Runtime requirement                 | Authentication            |
+| -------- | ----------------------------------- | ------------------------- |
+| `codex`  | Built `IGZPATCH_CODEX_IMAGE`        | `CODEX_API_KEY`           |
+| `openai` | Network access to the Responses API | `OPENAI_API_KEY`          |
+| `ollama` | Reachable Ollama server and model   | Optional `OLLAMA_API_KEY` |
 
-OpenAI and Ollama use the same bounded file/check tool loop. Codex runs non-interactively in `workspace-write` mode; model-generated shell commands have network disabled even though the Codex process can reach the API. Provider fallback is intentionally deferred.
+OpenAI and Ollama use the same bounded file-tool loop with separate read/discovery and edit/verification budgets, while the worker runs required checks when the model finishes or exhausts its action budget and feeds failures back for repair. Codex runs non-interactively in `workspace-write` mode; model-generated shell commands have network disabled even though the Codex process can reach the API. Provider fallback is intentionally deferred.
+
+Every provider returns a normalized change summary. IgzPatch uses that same concise subject for the commit and draft PR title, and records the selected provider and model in the issue comment and PR audit section.
 
 ## Local Setup
 

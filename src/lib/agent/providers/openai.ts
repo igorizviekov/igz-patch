@@ -11,16 +11,18 @@ import type {
 } from "@/lib/agent/providers/types";
 import { buildAgentPrompt } from "@/lib/agent/providers/prompt";
 
+interface OpenAiOutputItem extends Record<string, unknown> {
+  type?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+  content?: Array<{ type?: string; text?: string }>;
+}
+
 interface OpenAiResponse {
   id?: string;
   output_text?: string;
-  output?: Array<{
-    type?: string;
-    call_id?: string;
-    name?: string;
-    arguments?: string;
-    content?: Array<{ type?: string; text?: string }>;
-  }>;
+  output?: OpenAiOutputItem[];
   error?: { message?: string };
 }
 
@@ -58,6 +60,7 @@ export async function runOpenAiAgent(
     prompt: buildAgentPrompt(request),
     toolbox,
     maxIterations: request.config.agent.max_iterations,
+    maxReadTurns: request.config.agent.max_read_turns,
     readOnlyFirstPass: request.config.agent.read_only_first_pass,
     onToolEvent: request.onToolEvent,
   });
@@ -80,10 +83,12 @@ export function createOpenAiSession({
   organization?: string;
   project?: string;
 }): AgentModelSession {
-  let previousResponseId: string | undefined;
+  let conversationItems: Array<Record<string, unknown>> = [];
 
   return {
     async next(inputs, tools) {
+      const currentInputs = inputs.map(toOpenAiInput);
+      const requestInput = [...conversationItems, ...currentInputs];
       const response = await fetchImpl(`${trimTrailingSlash(baseUrl)}/responses`, {
         method: "POST",
         headers: {
@@ -94,11 +99,11 @@ export function createOpenAiSession({
         },
         body: JSON.stringify({
           model,
-          input: inputs.map(toOpenAiInput),
+          input: requestInput,
           tools: tools.map(toOpenAiTool),
           parallel_tool_calls: false,
           store: false,
-          ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
+          include: ["reasoning.encrypted_content"],
         }),
         signal: AbortSignal.timeout(remainingTimeout(deadline)),
       });
@@ -110,8 +115,7 @@ export function createOpenAiSession({
           `OpenAI API request failed (${response.status}): ${body.error?.message ?? rawBody.slice(0, 500)}`,
         );
       }
-      if (!body.id) throw new Error("OpenAI response did not include an id");
-      previousResponseId = body.id;
+      conversationItems = [...requestInput, ...(body.output ?? [])];
       return parseOpenAiTurn(body);
     },
   };

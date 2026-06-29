@@ -1,6 +1,7 @@
 import { runCodexAgent } from "@/lib/agent/providers/codex";
 import { runOllamaAgent } from "@/lib/agent/providers/ollama";
 import { runOpenAiAgent } from "@/lib/agent/providers/openai";
+import { deriveChangeSummary } from "@/lib/agent/publication";
 import { agentProviderSchema } from "@/lib/agent/repo-config";
 import type {
   AgentProviderRequest,
@@ -26,7 +27,11 @@ export async function runConfiguredAgent(
       break;
   }
 
-  return { ...selection, summary };
+  return {
+    ...selection,
+    summary,
+    changeSummary: deriveChangeSummary(summary, request.run.issue_title),
+  };
 }
 
 export function resolveAgentProvider(

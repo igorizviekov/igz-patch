@@ -176,7 +176,7 @@ export function createDockerSandbox({
           model,
           "-",
         ],
-        containerEnv: { CODEX_API_KEY: apiKey, CODEX_HOME: "/tmp/codex" },
+        containerEnv: { CODEX_API_KEY: apiKey, CODEX_HOME: "/codex-home" },
         displayCommand: "docker run [Codex provider]",
         workspaceReadOnly: readOnly,
       });
@@ -243,6 +243,7 @@ export function buildDockerRunArgs({
   const args = [
     "run",
     "--rm",
+    "--interactive",
     "--init",
     "--name",
     name,
@@ -263,6 +264,8 @@ export function buildDockerRunArgs({
     "--read-only",
     "--tmpfs",
     "/tmp:rw,noexec,nosuid,size=268435456",
+    "--tmpfs",
+    "/codex-home:rw,nosuid,size=67108864",
     "--volume",
     `${workspace}:/workspace:${workspaceReadOnly ? "ro" : "rw"}`,
     "--volume",
@@ -272,6 +275,7 @@ export function buildDockerRunArgs({
     "--entrypoint",
     entrypoint,
   ];
+  if (phase === "provider") args.push("--security-opt", "seccomp=unconfined");
   if (user) args.push("--user", user);
   for (const name of Object.keys(containerEnv)) args.push("--env", name);
   args.push(image, ...commandArgs);

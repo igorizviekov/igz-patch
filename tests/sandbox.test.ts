@@ -20,6 +20,8 @@ test("Docker setup containers enforce resources and allow setup networking", () 
   });
 
   assertArgPair(args, "--network", "bridge");
+  assert.equal(args.includes("seccomp=unconfined"), false);
+  assert.ok(args.includes("--interactive"));
   assertArgPair(args, "--cpus", "1.5");
   assertArgPair(args, "--memory", "2048m");
   assertArgPair(args, "--memory-swap", "2048m");
@@ -29,6 +31,8 @@ test("Docker setup containers enforce resources and allow setup networking", () 
   assertArgPair(args, "--volume", "/tmp/repository:/workspace:rw");
   assert.ok(args.includes("/tmp/repository/.git:/workspace/.git:ro"));
   assert.ok(args.includes("--read-only"));
+  assertArgPair(args, "--tmpfs", "/tmp:rw,noexec,nosuid,size=268435456");
+  assert.ok(args.includes("/codex-home:rw,nosuid,size=67108864"));
   assert.equal(args.filter((arg) => arg.includes(":/workspace")).length, 2);
 });
 
@@ -66,13 +70,19 @@ test("Codex provider container keeps API networking separate from command networ
       "sandbox_workspace_write.network_access=false",
       "-",
     ],
-    containerEnv: { CODEX_API_KEY: "not-visible" },
+    containerEnv: { CODEX_API_KEY: "not-visible", CODEX_HOME: "/codex-home" },
     workspaceReadOnly: true,
   });
 
   assertArgPair(args, "--network", "bridge");
+  assert.ok(args.includes("--interactive"));
+  assert.ok(args.some((arg, index) => arg === "--security-opt" && args[index + 1] === "seccomp=unconfined"));
+  assert.ok(args.some((arg, index) => arg === "--env" && args[index + 1] === "CODEX_HOME"));
+  assert.ok(args.includes("/codex-home:rw,nosuid,size=67108864"));
   assert.ok(args.includes("sandbox_workspace_write.network_access=false"));
+  assert.equal(args.at(-1), "-");
   assert.ok(args.includes("/tmp/repository:/workspace:ro"));
+  assert.equal(args.includes("/codex-home"), false);
   assert.equal(args.includes("not-visible"), false);
 });
 

@@ -14,7 +14,8 @@ import {
   hardenedGitEnvironment,
   protectedGitArguments,
 } from "@/lib/agent/git-security";
-import { runConfiguredAgent } from "@/lib/agent/providers";
+import { runConfiguredAgent, type AgentProviderResult } from "@/lib/agent/providers";
+import { renderPublicationTitle } from "@/lib/agent/publication";
 import { defaultRepoConfig, enforceWorkerRepoPolicy, type RepoConfig } from "@/lib/agent/repo-config";
 import { loadRepoConfig } from "@/lib/agent/repo-config-local";
 import { createDockerSandbox, type AgentSandbox } from "@/lib/agent/sandbox";
@@ -47,6 +48,8 @@ export async function executeRun(
   let config: RepoConfig | null = null;
   let sandbox: AgentSandbox | null = null;
   let pullRequestUrl: string | null = null;
+  let agentProvider: string | null = null;
+  let agentModel: string | null = null;
   const addEvent = (
     eventType: string,
     message: string,
@@ -94,6 +97,10 @@ export async function executeRun(
       throw new BlockedRunError("Issue lacks explicit acceptance criteria required by repository config.");
     }
     const deadline = Date.now() + config.sandbox.timeout_minutes * 60_000;
+    const selectedProvider = process.env.IGZPATCH_AGENT_PROVIDER ?? config.routing.primary.provider;
+    const selectedModel = process.env.IGZPATCH_AGENT_MODEL ?? config.routing.primary.model;
+    agentProvider = selectedProvider;
+    agentModel = selectedModel;
     sandbox = createDockerSandbox({
       workspace,
       runId: run.id,
@@ -128,7 +135,12 @@ export async function executeRun(
         octokit: requireOctokit(octokit),
         run: currentRun,
         headline: "editing",
-        details: ["Repository cloned.", `Branch: \`${branchName}\``],
+        details: [
+          "Repository cloned.",
+          `Branch: \`${branchName}\``,
+          `Provider: \`${safeMetadataValue(selectedProvider)}\``,
+          `Model: \`${safeMetadataValue(selectedModel)}\``,
+        ],
         lease,
       }),
     );
@@ -136,14 +148,22 @@ export async function executeRun(
     await runSetup(sandbox, config, deadline, addEvent);
     await assertRunActive(run.id, lease, assertHeartbeat);
     await addEvent("agent", "Starting configured agent provider", {
-      provider: process.env.IGZPATCH_AGENT_PROVIDER ?? config.routing.primary.provider,
-      model: process.env.IGZPATCH_AGENT_MODEL ?? config.routing.primary.model,
+      provider: agentProvider,
+      model: agentModel,
     });
     const agentResult = await runAgent(workspace, currentRun, config, sandbox, deadline, addEvent);
+    agentProvider = agentResult.provider;
+    agentModel = agentResult.model;
+    const publicationTitle = renderPublicationTitle(
+      config.pull_request.title_template,
+      agentResult.changeSummary,
+      run.issue_number,
+    );
     await assertRunActive(run.id, lease, assertHeartbeat);
     await addEvent("agent_completed", "Agent provider completed", {
       provider: agentResult.provider,
       model: agentResult.model,
+      change_summary: agentResult.changeSummary,
       summary: truncateText(redactText(agentResult.summary, config.audit.redact_patterns)),
     });
     await runChecks(sandbox, config, deadline, addEvent);
@@ -188,7 +208,7 @@ export async function executeRun(
       [
         "-c", "user.name=IgzPatch",
         "-c", "user.email=igzpatch[bot]@users.noreply.github.com",
-        "commit", "-m", `IgzPatch: fix issue #${run.issue_number}`,
+        "commit", "-m", publicationTitle,
       ],
       safeExecutionEnvironment(),
       remainingTimeout(deadline, 120_000),
@@ -213,8 +233,12 @@ export async function executeRun(
         run: currentRun,
         branchName,
         baseBranch: finalConfig.repo.default_branch,
-        title: finalConfig.pull_request.title_template.replace("#{issue_number}", String(run.issue_number)),
-        body: renderPullRequestBody({ run: currentRun, diffSummary: trustedDiffSummary }),
+        title: publicationTitle,
+        body: renderPullRequestBody({
+          run: currentRun,
+          diffSummary: trustedDiffSummary,
+          agentResult,
+        }),
       }),
     );
 
@@ -224,6 +248,9 @@ export async function executeRun(
     }));
     await bestEffort(() => addRunEvent(run.id, "succeeded", "Opened draft pull request", {
       pull_request_url: pullRequestUrl,
+      provider: agentResult.provider,
+      model: agentResult.model,
+      change_summary: agentResult.changeSummary,
     }));
     await bestEffort(() => retryTransient(() =>
       upsertRunStatusComment({
@@ -232,6 +259,9 @@ export async function executeRun(
         headline: "draft PR opened",
         details: [
           `PR: ${pullRequestUrl}`,
+          `Change: ${agentResult.changeSummary}`,
+          `Provider: \`${safeMetadataValue(agentResult.provider)}\``,
+          `Model: \`${safeMetadataValue(agentResult.model)}\``,
           `Changed files: ${trustedDiffSummary.changedFiles.length}`,
           `Diff lines: +${trustedDiffSummary.addedLines} / -${trustedDiffSummary.deletedLines}`,
         ],
@@ -276,7 +306,11 @@ export async function executeRun(
             octokit: requireOctokit(octokit),
             run: updated,
             headline: retryQueued ? "retry queued" : status,
-            details: [message],
+            details: [
+              ...(agentProvider ? [`Provider: \`${safeMetadataValue(agentProvider)}\``] : []),
+              ...(agentModel ? [`Model: \`${safeMetadataValue(agentModel)}\``] : []),
+              message,
+            ],
           }),
         );
       } catch (commentError) {
@@ -488,16 +522,18 @@ function assertBlockingCommandSucceeded(
 function renderPullRequestBody({
   run,
   diffSummary,
+  agentResult,
 }: {
   run: RunRecord;
   diffSummary: { changedFiles: string[]; addedLines: number; deletedLines: number };
+  agentResult: AgentProviderResult;
 }): string {
   return [
     `Fixes #${run.issue_number}`,
     "",
     "## What changed",
     "",
-    "- IgzPatch produced a bounded patch for the linked issue.",
+    `- ${agentResult.changeSummary}`,
     `- Changed files: ${diffSummary.changedFiles.length}`,
     `- Diff lines: +${diffSummary.addedLines} / -${diffSummary.deletedLines}`,
     "",
@@ -508,9 +544,15 @@ function renderPullRequestBody({
     "## Audit",
     "",
     `- IgzPatch run: ${run.id}`,
+    `- Provider: \`${safeMetadataValue(agentResult.provider)}\``,
+    `- Model: \`${safeMetadataValue(agentResult.model)}\``,
     `- Trigger: ${run.trigger_kind}`,
     "- This PR is draft-only and requires human review before merge.",
   ].join("\n");
+}
+
+function safeMetadataValue(value: string): string {
+  return value.replace(/[`\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
 }
 
 function formatBranchName(prefix: string, run: RunRecord): string {

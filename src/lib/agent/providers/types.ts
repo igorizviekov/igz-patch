@@ -33,6 +33,7 @@ export interface AgentProviderSelection {
 
 export interface AgentProviderResult extends AgentProviderSelection {
   summary: string;
+  changeSummary: string;
 }
 
 export interface AgentToolDefinition {

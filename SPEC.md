@@ -144,7 +144,7 @@ branch:
 
 pull_request:
   draft: true
-  title_template: 'IgzPatch: fix issue #{issue_number}'
+  title_template: '#{change_summary}'
   body_policy: evidence_summary
 
 sandbox:
@@ -186,6 +186,7 @@ issue_scope:
 
 agent:
   max_iterations: 3
+  max_read_turns: 12
   read_only_first_pass: true
   open_pr_as_draft: true
   require_manual_merge: true
@@ -258,7 +259,7 @@ The first worker is intentionally simple:
 10. Commit, push, and open a draft PR.
 11. Update the run comment and Postgres status.
 
-Every provider receives the same issue, repository, policy, iteration, sandbox, and timeout contract. Setup and checks run in the target repository's configured Docker image. The Codex adapter invokes `codex exec` in a pinned provider image and non-interactive `workspace-write` mode. The OpenAI Responses API and Ollama adapters share a bounded tool loop whose write tools enforce repository path policy and whose command tool can run only configured checks. Worker-wide environment overrides make provider changes operational rather than code changes.
+Every provider receives the same issue, repository, policy, iteration, sandbox, and timeout contract. Setup and checks run in the target repository's configured Docker image. The Codex adapter invokes `codex exec` in a pinned provider image and non-interactive `workspace-write` mode. The OpenAI Responses API and Ollama adapters share a bounded file-tool loop whose write tools enforce repository path policy. Read-only discovery turns have their own cap and do not consume edit/verification iterations. The worker owns required-check execution, runs checks when the model finishes or exhausts its action budget, and returns failures to the model for repair. Worker-wide environment overrides make provider changes operational rather than code changes.
 
 ## Blocked Conditions
 

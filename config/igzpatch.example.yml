@@ -18,7 +18,7 @@ branch:
 
 pull_request:
   draft: true
-  title_template: 'IgzPatch: fix issue #{issue_number}'
+  title_template: '#{change_summary}'
   body_policy: evidence_summary
 
 sandbox:
@@ -59,6 +59,7 @@ issue_scope:
 
 agent:
   max_iterations: 3
+  max_read_turns: 12
   read_only_first_pass: true
   open_pr_as_draft: true
   require_manual_merge: true

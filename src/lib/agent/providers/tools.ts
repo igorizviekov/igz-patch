@@ -32,6 +32,7 @@ const sensitiveFileNames = new Set([".netrc", ".npmrc", ".pypirc"]);
 
 export interface AgentToolbox {
   definitions: AgentToolDefinition[];
+  requiredCheckCommands: readonly string[];
   readonly mutationCount: number;
   readonly requiredChecksPassed: boolean;
   execute(name: string, input: unknown): Promise<string>;
@@ -55,9 +56,11 @@ export function createAgentToolbox({
   let mutations = 0;
   const checkResults = new Map<string, boolean>();
   const definitions = createToolDefinitions(config.checks.required);
+  const requiredCheckCommands = [...config.checks.required];
 
   return {
     definitions,
+    requiredCheckCommands,
     get mutationCount() {
       return mutations;
     },

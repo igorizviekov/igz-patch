@@ -27,6 +27,8 @@ export function buildAgentPrompt({ run, config }: AgentProviderRequest): string 
     `- Maximum changed files: ${config.issue_scope.max_files_changed}`,
     `- Maximum changed diff lines: ${config.issue_scope.max_diff_lines}`,
     `- Read-only first pass: ${config.agent.read_only_first_pass}`,
+    `- Maximum discovery/read turns: ${config.agent.max_read_turns}`,
+    `- Maximum edit/verification iterations: ${config.agent.max_iterations}`,
     "",
     "Required checks:",
     requiredChecks,
@@ -36,8 +38,10 @@ export function buildAgentPrompt({ run, config }: AgentProviderRequest): string 
     "- Make only changes required by the issue and acceptance criteria.",
     "- Use the available tools for repository access; do not invent file contents.",
     "- Do not edit blocked paths or files outside the writable globs.",
-    "- Run the configured checks when a check tool is available.",
+    "- Required checks are run automatically by the worker when you finish or exhaust the turn budget.",
+    "- If worker verification fails, use the diagnostic results to repair the patch before finishing.",
     "- Do not commit, push, create branches, or open a pull request.",
     "- Finish only after repository files contain the intended patch.",
+    "- End the final response with exactly one line in this form: CHANGE_SUMMARY: <imperative description of the completed change, at most 72 characters>.",
   ].join("\n");
 }

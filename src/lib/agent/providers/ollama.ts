@@ -55,6 +55,7 @@ export async function runOllamaAgent(
     prompt: buildAgentPrompt(request),
     toolbox,
     maxIterations: request.config.agent.max_iterations,
+    maxReadTurns: request.config.agent.max_read_turns,
     readOnlyFirstPass: request.config.agent.read_only_first_pass,
     onToolEvent: request.onToolEvent,
   });

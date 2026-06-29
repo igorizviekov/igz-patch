@@ -34,7 +34,7 @@ const repoConfigSchema = z.object({
   pull_request: z
     .object({
       draft: z.literal(true).default(true),
-      title_template: z.string().default("IgzPatch: fix issue #{issue_number}"),
+      title_template: z.string().default("#{change_summary}"),
       body_policy: z.enum(["evidence_summary"]).default("evidence_summary"),
     }).strict()
     .default({}),
@@ -65,6 +65,7 @@ const repoConfigSchema = z.object({
   agent: z
     .object({
       max_iterations: z.number().int().positive().default(3),
+      max_read_turns: z.number().int().positive().default(12),
       read_only_first_pass: z.boolean().default(true),
       open_pr_as_draft: z.literal(true).default(true),
       require_manual_merge: z.literal(true).default(true),
@@ -113,7 +114,7 @@ export const defaultRepoConfig: RepoConfig = {
   },
   pull_request: {
     draft: true,
-    title_template: "IgzPatch: fix issue #{issue_number}",
+    title_template: "#{change_summary}",
     body_policy: "evidence_summary",
   },
   sandbox: {
@@ -142,6 +143,7 @@ export const defaultRepoConfig: RepoConfig = {
   },
   agent: {
     max_iterations: 3,
+    max_read_turns: 12,
     read_only_first_pass: true,
     open_pr_as_draft: true,
     require_manual_merge: true,
