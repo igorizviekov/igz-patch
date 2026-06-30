@@ -7,6 +7,7 @@ IgzPatch is a GitHub App that turns explicitly labeled issues into verified draf
 - Triggers from configured labels or maintainer-only `@IgzPatch fix`, `@IgzPatch status`, and `@IgzPatch stop` commands.
 - Authenticates with short-lived GitHub App installation tokens, never personal credentials.
 - Supports configurable Codex CLI and OpenAI Responses API providers and models.
+- Blocks explicit policy overrides, verification bypasses, protected-path tampering, and credential-access requests before invoking an agent.
 - Runs bounded agent, setup, repair, and verification loops in disposable Docker containers.
 - Keeps generated commands offline; dependency setup requires explicit network opt-in.
 - Validates a fail-closed `.igzpatch.yml` contract and enforces path, resource, file, and diff limits.
@@ -76,3 +77,7 @@ Add the configured label (default: `igz:fix`) to an issue. For local control-pla
 - [Run dashboard](https://igz-patch.vercel.app/) — requires HTTP Basic authentication
 - [Demo repository](https://github.com/igorizviekov/igzpatch-demo) — seeded logic and responsive-CSS issues
 - [Source repository](https://github.com/igorizviekov/igz-patch)
+
+## License
+
+Licensed under the [MIT License](LICENSE).

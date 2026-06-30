@@ -281,6 +281,7 @@ export function buildDockerRunArgs({
     entrypoint,
   ];
   if (phase !== "provider") args.splice(3, 0, "--init");
+  if (phase === "provider") args.push("--security-opt", "seccomp=unconfined");
   if (user) args.push("--user", user);
   for (const name of Object.keys(containerEnv)) args.push("--env", name);
   args.push(image, ...commandArgs);

@@ -56,7 +56,7 @@ test("Docker run phase disables network and never exposes environment values in 
   assert.equal(args.includes("not-visible"), false);
 });
 
-test("Codex provider container keeps API networking constrained by the default seccomp policy", () => {
+test("Codex provider container supports the inner offline command sandbox", () => {
   const config = structuredClone(defaultRepoConfig);
   const args = buildDockerRunArgs({
     name: "igzpatch-test-codex",
@@ -82,7 +82,7 @@ test("Codex provider container keeps API networking constrained by the default s
   assertArgPair(args, "--network", "bridge");
   assert.ok(args.includes("--interactive"));
   assert.equal(args.includes("--init"), false);
-  assert.equal(args.includes("seccomp=unconfined"), false);
+  assert.ok(args.some((arg, index) => arg === "--security-opt" && args[index + 1] === "seccomp=unconfined"));
   assert.ok(args.some((arg, index) => arg === "--env" && args[index + 1] === "CODEX_HOME"));
   assert.ok(args.some((arg, index) => arg === "--env" && args[index + 1] === "LD_PRELOAD"));
   assert.ok(args.includes("/codex-home:rw,nosuid,size=67108864"));

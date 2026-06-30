@@ -14,6 +14,7 @@ import {
   hardenedGitEnvironment,
   protectedGitArguments,
 } from "@/lib/agent/git-security";
+import { assertSafeIssueRequest } from "@/lib/agent/issue-safety";
 import { runConfiguredAgent, type AgentProviderResult } from "@/lib/agent/providers";
 import { renderPublicationTitle } from "@/lib/agent/publication";
 import { defaultRepoConfig, enforceWorkerRepoPolicy, type RepoConfig } from "@/lib/agent/repo-config";
@@ -97,6 +98,8 @@ export async function executeRun(
     if (config.issue_scope.requires_acceptance_criteria && !hasAcceptanceCriteria(run.issue_body)) {
       throw new BlockedRunError("Issue lacks explicit acceptance criteria required by repository config.");
     }
+    assertSafeIssueRequest({ title: run.issue_title, body: run.issue_body, config });
+    await addEvent("issue_policy", "Issue request passed deterministic abuse policy");
     const deadline = Date.now() + config.sandbox.timeout_minutes * 60_000;
     const selectedProvider = process.env.IGZPATCH_AGENT_PROVIDER ?? config.routing.primary.provider;
     const selectedModel = process.env.IGZPATCH_AGENT_MODEL ?? config.routing.primary.model;
