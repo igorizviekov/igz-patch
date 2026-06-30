@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import type { getInstallationOctokit } from "@/lib/github/app";
 
-export const agentProviderSchema = z.enum(["codex", "openai"]);
+export const agentProviderSchema = z.enum(["codex", "openai", "ollama"]);
 export type AgentProvider = z.infer<typeof agentProviderSchema>;
 
 export class RepoConfigValidationError extends Error {

@@ -6,7 +6,7 @@ IgzPatch is a GitHub App that turns explicitly labeled issues into verified draf
 
 - Triggers from configured labels or `@IgzPatch fix`; public fix commands are optional, while `status` and `stop` remain maintainer-only.
 - Authenticates with short-lived GitHub App installation tokens, never personal credentials.
-- Supports configurable Codex CLI and OpenAI Responses API providers and models.
+- Supports configurable Codex CLI, OpenAI Responses API, and local Ollama providers and models.
 - Blocks explicit policy overrides, verification bypasses, protected-path tampering, and credential-access requests before invoking an agent.
 - Runs bounded agent, setup, repair, and verification loops in disposable Docker containers.
 - Keeps generated commands offline; dependency setup requires explicit network opt-in.
@@ -36,7 +36,21 @@ npm run db:init
 
 ### 2. Choose an agent
 
-Set either `CODEX_API_KEY` or `OPENAI_API_KEY` in `.env`. The target repository selects its provider and model in `.igzpatch.yml`; `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH_AGENT_MODEL` provide worker-wide overrides.
+The target repository selects its provider and model in `.igzpatch.yml`; `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH_AGENT_MODEL` provide worker-wide overrides.
+
+- For `codex`, set `CODEX_API_KEY`.
+- For `openai`, set `OPENAI_API_KEY`.
+- For `ollama`, start Ollama on the worker host, pull a model that supports tool calling, and set `IGZPATCH_OLLAMA_BASE_URL` if it is not available at `http://127.0.0.1:11434`. Local Ollama does not require an API key; `OLLAMA_API_KEY` is available for authenticated compatible endpoints.
+
+For example, to select a locally installed Ollama model worker-wide:
+
+```bash
+IGZPATCH_AGENT_PROVIDER="ollama"
+IGZPATCH_AGENT_MODEL="qwen3-coder"
+IGZPATCH_OLLAMA_BASE_URL="http://127.0.0.1:11434"
+```
+
+If the worker itself runs in Docker, use a host-reachable address such as `http://host.docker.internal:11434`. Repository tools and required checks still execute in the isolated Docker sandbox; only the worker process talks to Ollama.
 
 ### 3. Configure the target repository
 
@@ -47,7 +61,7 @@ Set `IGZPATCH_ALLOW_SETUP_NETWORK="true"` on the worker only when setup must dow
 ### 4. Validate
 
 ```bash
-npm run docker:build-agent
+npm run docker:build-agent # required only for the Codex provider
 npm run typecheck
 npm test
 npm run build
@@ -82,4 +96,4 @@ Add the configured label (default: `igz:fix`) to an issue. For local control-pla
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE). Attribution notices are provided in [NOTICE](NOTICE).

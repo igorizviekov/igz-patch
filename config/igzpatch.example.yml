@@ -68,6 +68,7 @@ agent:
 
 routing:
   primary:
+    # Supported providers: codex, openai, ollama
     provider: codex
     model: gpt-5.4
 

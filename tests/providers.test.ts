@@ -18,6 +18,7 @@ import { runCodexAgent } from "@/lib/agent/providers/codex";
 import { enforceDiffPolicy, readDiffSummary } from "@/lib/agent/diff";
 import { protectedGitArguments } from "@/lib/agent/git-security";
 import { resolveAgentProvider } from "@/lib/agent/providers";
+import { runOllamaAgent } from "@/lib/agent/providers/ollama";
 import { runOpenAiAgent } from "@/lib/agent/providers/openai";
 import { createAgentToolbox } from "@/lib/agent/providers/tools";
 import type { AgentProviderRequest } from "@/lib/agent/providers/types";
@@ -89,7 +90,7 @@ test("repo config rejects unknown policy fields", () => {
   });
 });
 
-test("repo config rejects the removed Ollama provider", () => {
+test("repo config validates the Ollama provider", () => {
   withWorkspace((workspace) => {
     writeFileSync(
       join(workspace, ".igzpatch.yml"),
@@ -102,7 +103,8 @@ test("repo config rejects the removed Ollama provider", () => {
       ].join("\n"),
     );
 
-    assert.throws(() => loadRepoConfig(workspace), /Invalid enum value/);
+    const config = loadRepoConfig(workspace);
+    assert.deepEqual(config.routing.primary, { provider: "ollama", model: "qwen3-coder" });
   });
 });
 
@@ -164,9 +166,9 @@ test("worker environment can override repository provider routing", () => {
   assert.deepEqual(
     resolveAgentProvider(
       { config },
-      { IGZPATCH_AGENT_PROVIDER: "openai", IGZPATCH_AGENT_MODEL: "gpt-5.5" },
+      { IGZPATCH_AGENT_PROVIDER: "ollama", IGZPATCH_AGENT_MODEL: "qwen3-coder" },
     ),
-    { provider: "openai", model: "gpt-5.5" },
+    { provider: "ollama", model: "qwen3-coder" },
   );
   assert.throws(
     () => resolveAgentProvider({ config }, { IGZPATCH_AGENT_PROVIDER: "invalid" }),
@@ -628,6 +630,71 @@ test("OpenAI provider stops after the configured read-turn budget", async () => 
   });
 });
 
+test("Ollama provider performs the shared read-edit-verify tool loop", async () => {
+  await withWorkspaceAsync(async (workspace) => {
+    mkdirSync(join(workspace, "src"));
+    writeFileSync(join(workspace, "src", "value.ts"), "export const value = 1;\n");
+    const requests: Array<Record<string, unknown>> = [];
+    const urls: string[] = [];
+    const authorizations: Array<string | null> = [];
+    const responses = [
+      ollamaToolResponse("read_file", { path: "src/value.ts" }),
+      ollamaToolResponse("replace_in_file", {
+        path: "src/value.ts",
+        old_text: "value = 1",
+        new_text: "value = 2",
+      }),
+      ollamaMessageResponse("CHANGE_SUMMARY: Update exported value"),
+    ];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      urls.push(String(input));
+      authorizations.push(new Headers(init?.headers).get("authorization"));
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      const response = responses.shift();
+      if (!response) throw new Error("Unexpected Ollama request");
+      return response;
+    }) as typeof fetch;
+
+    const request = makeRequest(workspace, { provider: "ollama", model: "qwen3-coder" });
+    request.config.checks.required = ["true"];
+    const toolEvents: string[] = [];
+    request.onToolEvent = async (event) => {
+      toolEvents.push(`${event.name}:${event.ok}`);
+    };
+    const summary = await runOllamaAgent(
+      request,
+      { provider: "ollama", model: "qwen3-coder" },
+      {
+        fetchImpl,
+        env: {
+          IGZPATCH_OLLAMA_BASE_URL: "http://localhost:11434/api",
+          OLLAMA_API_KEY: "test-key",
+        },
+      },
+    );
+
+    assert.equal(summary, "CHANGE_SUMMARY: Update exported value");
+    assert.match(readFileSync(join(workspace, "src", "value.ts"), "utf8"), /value = 2/);
+    assert.deepEqual(urls, Array(3).fill("http://localhost:11434/api/chat"));
+    assert.deepEqual(authorizations, Array(3).fill("Bearer test-key"));
+    assert.equal(requests[0]?.model, "qwen3-coder");
+    assert.equal(requests[0]?.stream, false);
+    assert.deepEqual(ollamaToolNames(requests[0]), [
+      "get_diff",
+      "list_files",
+      "read_file",
+      "search_files",
+    ]);
+    assert.ok(ollamaToolNames(requests[1]).includes("replace_in_file"));
+    assert.ok(!ollamaToolNames(requests[1]).includes("run_check"));
+    assert.deepEqual(ollamaMessageRoles(requests[0]), ["system", "user"]);
+    assert.deepEqual(ollamaMessageRoles(requests[1]), ["system", "user", "assistant", "tool"]);
+    assert.match(JSON.stringify(requests[0]?.messages), /untrusted data/);
+    assert.match(JSON.stringify(requests[1]?.messages), /untrusted_tool_output/);
+    assert.deepEqual(toolEvents, ["read_file:true", "replace_in_file:true", "run_check:true"]);
+  });
+});
+
 test("Codex provider invokes non-interactive workspace-write mode with prompt on stdin", async () => {
   await withWorkspaceAsync(async (workspace) => {
     let invocation: Parameters<typeof import("@/lib/agent/command").runProcess>[0] | undefined;
@@ -850,6 +917,26 @@ function openAiMessageResponse(id: string, outputText: string): Response {
   );
 }
 
+function ollamaToolResponse(name: string, args: Record<string, unknown>): Response {
+  return new Response(
+    JSON.stringify({
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ function: { name, arguments: args } }],
+      },
+    }),
+    { status: 200 },
+  );
+}
+
+function ollamaMessageResponse(content: string): Response {
+  return new Response(
+    JSON.stringify({ message: { role: "assistant", content } }),
+    { status: 200 },
+  );
+}
+
 function toolNames(body: Record<string, unknown> | undefined): string[] {
   const tools = (body?.tools ?? []) as Array<Record<string, unknown>>;
   return tools
@@ -860,6 +947,18 @@ function toolNames(body: Record<string, unknown> | undefined): string[] {
 function inputTypes(body: Record<string, unknown> | undefined): string[] {
   const inputs = (body?.input ?? []) as Array<Record<string, unknown>>;
   return inputs.map((input) => String(input.type ?? "message"));
+}
+
+function ollamaToolNames(body: Record<string, unknown> | undefined): string[] {
+  const tools = (body?.tools ?? []) as Array<{ function?: { name?: string } }>;
+  return tools
+    .map((tool) => String(tool.function?.name))
+    .sort();
+}
+
+function ollamaMessageRoles(body: Record<string, unknown> | undefined): string[] {
+  const messages = (body?.messages ?? []) as Array<{ role?: string }>;
+  return messages.map((message) => String(message.role));
 }
 
 function withWorkspace(callback: (workspace: string) => void): void {

@@ -1,4 +1,5 @@
 import { runCodexAgent } from "@/lib/agent/providers/codex";
+import { runOllamaAgent } from "@/lib/agent/providers/ollama";
 import { runOpenAiAgent } from "@/lib/agent/providers/openai";
 import { deriveChangeSummary } from "@/lib/agent/publication";
 import { agentProviderSchema } from "@/lib/agent/repo-config";
@@ -20,6 +21,9 @@ export async function runConfiguredAgent(
       break;
     case "openai":
       summary = await runOpenAiAgent(request, selection);
+      break;
+    case "ollama":
+      summary = await runOllamaAgent(request, selection);
       break;
   }
 

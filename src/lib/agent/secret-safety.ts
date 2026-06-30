@@ -4,6 +4,7 @@ import { redactText } from "@/lib/redaction";
 const protectedEnvironmentNames = [
   "CODEX_API_KEY",
   "OPENAI_API_KEY",
+  "OLLAMA_API_KEY",
   "GITHUB_PRIVATE_KEY",
   "GITHUB_WEBHOOK_SECRET",
   "DATABASE_URL",
