@@ -7,10 +7,10 @@ import {
 } from "@/lib/agent/repo-config";
 import {
   addRunEvent,
+  blockQueuedRun,
   createRun,
   findLatestRunForIssue,
   requestRunCancellation,
-  updateRun,
   type RunRecord,
 } from "@/lib/db/runs";
 import { requiredEnv } from "@/lib/env";
@@ -24,6 +24,7 @@ import {
 } from "@/lib/github/events";
 import { verifyGitHubSignature } from "@/lib/github/signature";
 import { upsertRunStatusComment } from "@/lib/github/status-comment";
+import { redactText, truncateText } from "@/lib/redaction";
 
 export const runtime = "nodejs";
 
@@ -144,15 +145,26 @@ async function blockRun(
   message: string,
   octokit: Awaited<ReturnType<typeof getInstallationOctokit>> | null,
 ) {
-  const blocked = await updateRun(run.id, {
-    status: "blocked",
-    blocked_reason: message,
-    error_message: null,
-  });
-  await addRunEvent(run.id, "blocked", message);
+  const safeMessage = truncateText(
+    redactText(message, defaultRepoConfig.audit.redact_patterns),
+    1_000,
+  );
+  const blocked = await blockQueuedRun(run.id, safeMessage);
+  if (blocked.status !== "blocked") {
+    return NextResponse.json(
+      { accepted: true, runId: blocked.id, status: blocked.status, validationPending: true },
+      { status: 202 },
+    );
+  }
+  await addRunEvent(run.id, "blocked", safeMessage);
   if (octokit) {
     try {
-      await upsertRunStatusComment({ octokit, run: blocked, headline: "blocked", details: [message] });
+      await upsertRunStatusComment({
+        octokit,
+        run: blocked,
+        headline: "blocked",
+        details: [`Reason: ${safeMessage.split(/\r?\n/, 1)[0]}`],
+      });
     } catch {
     }
   }

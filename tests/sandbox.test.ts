@@ -22,6 +22,7 @@ test("Docker setup containers enforce resources and allow setup networking", () 
   assertArgPair(args, "--network", "bridge");
   assert.equal(args.includes("seccomp=unconfined"), false);
   assert.ok(args.includes("--interactive"));
+  assert.ok(args.includes("--init"));
   assertArgPair(args, "--cpus", "1.5");
   assertArgPair(args, "--memory", "2048m");
   assertArgPair(args, "--memory-swap", "2048m");
@@ -38,7 +39,7 @@ test("Docker setup containers enforce resources and allow setup networking", () 
 
 test("Docker run phase disables network and never exposes environment values in arguments", () => {
   const config = structuredClone(defaultRepoConfig);
-  config.sandbox.run_network = "disabled";
+  config.sandbox.run_network = "enabled";
   const args = buildDockerRunArgs({
     name: "igzpatch-test-run",
     workspace: "/tmp/repository",
@@ -55,7 +56,7 @@ test("Docker run phase disables network and never exposes environment values in 
   assert.equal(args.includes("not-visible"), false);
 });
 
-test("Codex provider container keeps API networking separate from command networking", () => {
+test("Codex provider container keeps API networking constrained by the default seccomp policy", () => {
   const config = structuredClone(defaultRepoConfig);
   const args = buildDockerRunArgs({
     name: "igzpatch-test-codex",
@@ -70,14 +71,20 @@ test("Codex provider container keeps API networking separate from command networ
       "sandbox_workspace_write.network_access=false",
       "-",
     ],
-    containerEnv: { CODEX_API_KEY: "not-visible", CODEX_HOME: "/codex-home" },
+    containerEnv: {
+      CODEX_API_KEY: "not-visible",
+      CODEX_HOME: "/codex-home",
+      LD_PRELOAD: "/usr/local/lib/libigzpatch-nodump.so",
+    },
     workspaceReadOnly: true,
   });
 
   assertArgPair(args, "--network", "bridge");
   assert.ok(args.includes("--interactive"));
-  assert.ok(args.some((arg, index) => arg === "--security-opt" && args[index + 1] === "seccomp=unconfined"));
+  assert.equal(args.includes("--init"), false);
+  assert.equal(args.includes("seccomp=unconfined"), false);
   assert.ok(args.some((arg, index) => arg === "--env" && args[index + 1] === "CODEX_HOME"));
+  assert.ok(args.some((arg, index) => arg === "--env" && args[index + 1] === "LD_PRELOAD"));
   assert.ok(args.includes("/codex-home:rw,nosuid,size=67108864"));
   assert.ok(args.includes("sandbox_workspace_write.network_access=false"));
   assert.equal(args.at(-1), "-");

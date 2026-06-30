@@ -4,12 +4,14 @@ import { join } from "node:path";
 import type { RepoConfig } from "@/lib/agent/repo-config";
 import { assertCommandSucceeded, runProcess } from "@/lib/agent/command";
 import { hardenedGitEnvironment, protectedGitArguments } from "@/lib/agent/git-security";
+import { matchesPathGlob } from "@/lib/agent/path-policy";
 
 export interface DiffSummary {
   changedFiles: string[];
   addedLines: number;
   deletedLines: number;
   binaryFiles: string[];
+  symbolicLinks: string[];
   fileBytes: Record<string, number>;
   patchBytes: number;
 }
@@ -24,6 +26,7 @@ export async function readDiffSummary(workspace: string): Promise<DiffSummary> {
   const patch = await readBinaryPatch(workspace, 5_000_000);
   const changedFiles: string[] = [];
   const binaryFiles: string[] = [];
+  const symbolicLinks: string[] = [];
   const fileBytes: Record<string, number> = {};
   let addedLines = 0;
   let deletedLines = 0;
@@ -44,7 +47,9 @@ export async function readDiffSummary(workspace: string): Promise<DiffSummary> {
       deletedLines += Number(deleted);
     }
     try {
-      fileBytes[file] = lstatSync(join(workspace, file)).size;
+      const stat = lstatSync(join(workspace, file));
+      fileBytes[file] = stat.size;
+      if (stat.isSymbolicLink()) symbolicLinks.push(file);
     } catch {
       fileBytes[file] = 0;
     }
@@ -55,6 +60,7 @@ export async function readDiffSummary(workspace: string): Promise<DiffSummary> {
     addedLines,
     deletedLines,
     binaryFiles,
+    symbolicLinks,
     fileBytes,
     patchBytes: Buffer.byteLength(patch),
   };
@@ -107,6 +113,10 @@ export function enforceDiffPolicy(summary: DiffSummary, config: RepoConfig): voi
     throw new BlockedRunError(`Binary changes are not allowed: ${summary.binaryFiles.join(", ")}`);
   }
 
+  if (summary.symbolicLinks.length > 0) {
+    throw new BlockedRunError(`Symbolic-link changes are not allowed: ${summary.symbolicLinks.join(", ")}`);
+  }
+
   if (summary.patchBytes > config.issue_scope.max_patch_bytes) {
     throw new BlockedRunError(
       `Patch is ${summary.patchBytes} bytes, above max ${config.issue_scope.max_patch_bytes}.`,
@@ -122,10 +132,10 @@ export function enforceDiffPolicy(summary: DiffSummary, config: RepoConfig): voi
   }
 
   for (const file of summary.changedFiles) {
-    if (config.paths.blocked.some((pattern) => matchesSimpleGlob(file, pattern))) {
+    if (config.paths.blocked.some((pattern) => matchesPathGlob(file, pattern))) {
       throw new BlockedRunError(`Changed blocked path: ${file}`);
     }
-    if (!config.paths.allowed.some((pattern) => matchesSimpleGlob(file, pattern))) {
+    if (!config.paths.allowed.some((pattern) => matchesPathGlob(file, pattern))) {
       throw new BlockedRunError(`Changed path outside allowlist: ${file}`);
     }
   }
@@ -136,14 +146,4 @@ export class BlockedRunError extends Error {
     super(message);
     this.name = "BlockedRunError";
   }
-}
-
-function matchesSimpleGlob(file: string, pattern: string): boolean {
-  if (pattern.endsWith("/**")) {
-    return file.startsWith(pattern.slice(0, -3));
-  }
-  if (pattern.endsWith("*")) {
-    return file.startsWith(pattern.slice(0, -1));
-  }
-  return file === pattern;
 }

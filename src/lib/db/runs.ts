@@ -62,6 +62,17 @@ export interface RunLease {
   token: string;
 }
 
+type RunCommentFields = Partial<
+  Pick<RunRecord, "status_comment_id" | "status_comment_url">
+>;
+
+type LeasedRunFields = RunCommentFields & Partial<
+  Pick<
+    RunRecord,
+    "status" | "branch_name" | "pull_request_url" | "blocked_reason" | "error_message"
+  >
+>;
+
 export class LeaseLostError extends Error {
   constructor(runId: string) {
     super(`Worker no longer owns the active lease for run ${runId}`);
@@ -178,18 +189,7 @@ export async function heartbeatRun(runId: string, lease: RunLease, leaseMs: numb
 
 export async function updateRun(
   runId: string,
-  fields: Partial<
-    Pick<
-      RunRecord,
-      | "status"
-      | "status_comment_id"
-      | "status_comment_url"
-      | "branch_name"
-      | "pull_request_url"
-      | "blocked_reason"
-      | "error_message"
-    >
-  >,
+  fields: RunCommentFields,
 ): Promise<RunRecord> {
   return updateRunInternal(runId, fields);
 }
@@ -197,52 +197,42 @@ export async function updateRun(
 export async function updateRunWithLease(
   runId: string,
   lease: RunLease,
-  fields: Parameters<typeof updateRun>[1],
+  fields: LeasedRunFields,
 ): Promise<RunRecord> {
   return updateRunInternal(runId, fields, lease);
 }
 
 async function updateRunInternal(
   runId: string,
-  fields: Parameters<typeof updateRun>[1],
+  fields: LeasedRunFields,
   lease?: RunLease,
 ): Promise<RunRecord> {
   const sql = getSql();
-  const [current] = await sql<RunRecord[]>`
-    select * from igz_runs
-    where id = ${runId}
-      and (${lease?.owner ?? null}::text is null or (
-        lease_owner = ${lease?.owner ?? null}
-        and lease_token = ${lease?.token ?? null}
-        and status = 'running'
-        and lease_expires_at > now()
-      ))
-  `;
-  if (!current) {
-    if (lease) throw new LeaseLostError(runId);
-    throw new Error(`Run not found: ${runId}`);
-  }
-
-  const next = { ...current, ...fields };
-  const isTerminal = ["succeeded", "blocked", "failed"].includes(next.status);
-  const releasesLease = isTerminal || next.status === "queued";
+  const has = (name: keyof LeasedRunFields) => Object.prototype.hasOwnProperty.call(fields, name);
+  const hasStatus = has("status");
+  const nextStatus = fields.status ?? null;
+  const releasesLease = hasStatus && nextStatus !== null
+    && ["queued", "succeeded", "blocked", "failed"].includes(nextStatus);
+  const isTerminal = hasStatus && nextStatus !== null
+    && ["succeeded", "blocked", "failed"].includes(nextStatus);
 
   const [updated] = await sql<RunRecord[]>`
     update igz_runs
     set
-      status = ${next.status},
-      status_comment_id = ${next.status_comment_id},
-      status_comment_url = ${next.status_comment_url},
-      branch_name = ${next.branch_name},
-      pull_request_url = ${next.pull_request_url},
-      blocked_reason = ${next.blocked_reason},
-      error_message = ${next.error_message},
+      status = case when ${hasStatus} then ${nextStatus} else status end,
+      status_comment_id = case when ${has("status_comment_id")} then ${fields.status_comment_id ?? null} else status_comment_id end,
+      status_comment_url = case when ${has("status_comment_url")} then ${fields.status_comment_url ?? null} else status_comment_url end,
+      branch_name = case when ${has("branch_name")} then ${fields.branch_name ?? null} else branch_name end,
+      pull_request_url = case when ${has("pull_request_url")} then ${fields.pull_request_url ?? null} else pull_request_url end,
+      blocked_reason = case when ${has("blocked_reason")} then ${fields.blocked_reason ?? null} else blocked_reason end,
+      error_message = case when ${has("error_message")} then ${fields.error_message ?? null} else error_message end,
       lease_owner = case when ${releasesLease} then null else lease_owner end,
       lease_token = case when ${releasesLease} then null else lease_token end,
       lease_expires_at = case when ${releasesLease} then null else lease_expires_at end,
       finished_at = case
         when ${isTerminal} then coalesce(finished_at, now())
-        else null
+        when ${hasStatus} then null
+        else finished_at
       end,
       updated_at = now()
     where id = ${runId}
@@ -259,6 +249,29 @@ async function updateRunInternal(
     throw new Error(`Failed to update run: ${runId}`);
   }
   return updated;
+}
+
+export async function blockQueuedRun(runId: string, message: string): Promise<RunRecord> {
+  const sql = getSql();
+  const [blocked] = await sql<RunRecord[]>`
+    update igz_runs
+    set
+      status = 'blocked',
+      blocked_reason = ${message},
+      error_message = null,
+      lease_owner = null,
+      lease_token = null,
+      lease_expires_at = null,
+      finished_at = coalesce(finished_at, now()),
+      updated_at = now()
+    where id = ${runId} and status = 'queued'
+    returning *
+  `;
+  if (blocked) return blocked;
+
+  const [current] = await sql<RunRecord[]>`select * from igz_runs where id = ${runId}`;
+  if (!current) throw new Error(`Run not found: ${runId}`);
+  return current;
 }
 
 export async function addRunEvent(

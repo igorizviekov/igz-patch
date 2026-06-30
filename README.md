@@ -1,72 +1,78 @@
 # IgzPatch
 
-Bounded, auditable issue-to-draft-PR AI automation.
+IgzPatch is a GitHub App that turns explicitly labeled issues into verified draft pull requests. A Vercel control plane accepts webhooks, Postgres stores durable run state, and an always-on worker runs a configurable coding agent inside Docker.
 
-IgzPatch agent turns labeled GitHub issue into a draft pull request.
+## Features
 
-## Flow
+- Triggers from configured labels or maintainer-only `@IgzPatch fix`, `@IgzPatch status`, and `@IgzPatch stop` commands.
+- Authenticates with short-lived GitHub App installation tokens, never personal credentials.
+- Supports configurable Codex CLI and OpenAI Responses API providers and models.
+- Runs bounded agent, setup, repair, and verification loops in disposable Docker containers.
+- Keeps generated commands offline; dependency setup requires explicit network opt-in.
+- Validates a fail-closed `.igzpatch.yml` contract and enforces path, resource, file, and diff limits.
+- Protects immutable tests, secret-scans output, and verifies patches again in a fresh checkout.
+- Deduplicates webhooks, permits one active run per issue, and stores append-only audit events under fenced Postgres leases.
+- Maintains one marker-backed issue comment with provider/model details and a password-protected run dashboard.
+- Creates concise commits and draft PRs only after required checks pass; it never merges them.
 
-A Next.js control plane verifies webhooks and queues durable runs; a long-running worker leases each run, clones the target repository, invokes a configurable coding agent inside Docker, runs deterministic checks, enforces repository policy, and opens a draft PR.
+## Setup
 
-## Safety Model
+Requires Node.js 20.9+, Docker, Postgres (or Supabase Postgres), Vercel, and a GitHub account that can create an App.
 
-- Repositories opt in with `enabled: true` in `.igzpatch.yml`; missing config is disabled.
-- GitHub access uses short-lived installation tokens and refreshes the token before push.
-- Setup, provider tools, and checks run in disposable Docker containers with CPU, memory, process, capability, filesystem, output, and timeout limits; Git metadata is mounted read-only.
-- Setup network access and run network access are configured separately; run commands default to no network.
-- Allowed paths, blocked paths, changed-file count, diff-line, file-byte, patch-byte, image, and worker resource limits are enforced before push.
-- Untrusted work is transported as a bounded binary patch into a fresh checkout; only that trusted checkout can commit or receive GitHub credentials.
-- Every claim has a unique lease token, and worker writes fail atomically after lease expiry or reassignment.
-- The run dashboard requires HTTP Basic authentication through `IGZPATCH_DASHBOARD_PASSWORD`.
-- At least one deterministic required check is mandatory for enabled repositories.
-- Pull requests are always drafts and always require human merge.
-
-## Agent Providers
-
-Choose one provider and model in the target repository:
-
-```yaml
-routing:
-  primary:
-    provider: codex # codex | openai
-    model: gpt-5.4
-```
-
-The worker can override both values with `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH_AGENT_MODEL`.
-
-| Provider | Runtime requirement                 | Authentication   |
-| -------- | ----------------------------------- | ---------------- |
-| `codex`  | Built `IGZPATCH_CODEX_IMAGE`        | `CODEX_API_KEY`  |
-| `openai` | Network access to the Responses API | `OPENAI_API_KEY` |
-
-Both providers use the same worker-controlled verification and repair policy, and `max_iterations` consistently limits writable patch/check attempts. Codex delegates repository inspection and editing to the sandboxed Codex CLI; OpenAI uses an application-managed bounded file-tool loop with a separate read-turn guard. Model-generated commands run without network access. Local-model support and provider fallback are intentionally deferred.
-
-Every provider returns a normalized change summary. IgzPatch uses that same concise subject for the commit and draft PR title, and records the selected provider and model in the issue comment and PR audit section.
-
-## Local Setup
-
-Requires Node.js 20.9+, Docker, Postgres, and a GitHub App.
+### 1. Install and initialize
 
 ```bash
 npm install
 cp .env.example .env
+```
+
+Set `DATABASE_URL` and `IGZPATCH_DASHBOARD_PASSWORD` in `.env`, then apply the database schema:
+
+```bash
+set -a; source .env; set +a
 npm run db:init
+```
+
+### 2. Choose an agent
+
+Set either `CODEX_API_KEY` or `OPENAI_API_KEY` in `.env`. The target repository selects its provider and model in `.igzpatch.yml`; `IGZPATCH_AGENT_PROVIDER` and `IGZPATCH_AGENT_MODEL` provide worker-wide overrides.
+
+### 3. Configure the target repository
+
+Copy [`config/igzpatch.example.yml`](config/igzpatch.example.yml) into the target repository as `.igzpatch.yml`. Enable it and tailor its triggers, provider, model, setup commands, checks, allowed paths, and limits.
+
+Set `IGZPATCH_ALLOW_SETUP_NETWORK="true"` on the worker only when setup must download dependencies.
+
+### 4. Validate
+
+```bash
 npm run docker:build-agent
 npm run typecheck
 npm test
+npm run build
 ```
 
-Run the web control plane and worker as separate processes:
+### 5. Deploy and connect GitHub
+
+1. Deploy this repository to Vercel with `DATABASE_URL` and `IGZPATCH_DASHBOARD_PASSWORD`.
+2. Create a GitHub App with webhook URL `https://<your-domain>/api/github/webhook`.
+3. Grant Metadata read, Contents read/write, Issues read/write, Pull requests read/write, and Checks read; subscribe to Issues and Issue comments.
+4. Create a webhook secret and private key, then install the App only on selected repositories.
+5. Add `GITHUB_APP_ID`, `GITHUB_WEBHOOK_SECRET`, and `GITHUB_PRIVATE_KEY` to `.env` and Vercel, then redeploy. Store the PEM on one quoted line with literal `\n` separators.
+
+### 6. Run
+
+Keep the worker running on an always-on Docker host:
 
 ```bash
-npm run dev
 npm run worker
 ```
 
-## Repository Contract
+Add the configured label (default: `igz:fix`) to an issue. For local control-plane development, run `npm run dev`. The dashboard username is `igzpatch`; its password is `IGZPATCH_DASHBOARD_PASSWORD`.
 
-Copy `config/igzpatch.example.yml` to the target repository as `.igzpatch.yml`, then narrow its paths and checks. Configuration is validated fail-closed, including unknown fields. Maintainer-only issue commands are `@IgzPatch fix`, `@IgzPatch status`, and `@IgzPatch stop`.
+## Links
 
-The worker accepts only images in `IGZPATCH_ALLOWED_SANDBOX_IMAGES` and only package-manager setup/check command forms. Repository policy can tighten worker limits but cannot raise them.
-
-The companion [`igzpatch-demo`](https://github.com/igorizviekov/igzpatch-demo) repository is a small incident-response dashboard with five independently seeded logic and responsive-CSS failures.
+- [GitHub App](https://github.com/apps/igzpatch)
+- [Run dashboard](https://igz-patch.vercel.app/) — requires HTTP Basic authentication
+- [Demo repository](https://github.com/igorizviekov/igzpatch-demo) — seeded logic and responsive-CSS issues
+- [Source repository](https://github.com/igorizviekov/igz-patch)

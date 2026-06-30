@@ -127,8 +127,8 @@ export const defaultRepoConfig: RepoConfig = {
     optional: [],
   },
   paths: {
-    allowed: ["app/**", "src/**", "tests/**"],
-    blocked: [".env*", ".github/workflows/**"],
+    allowed: ["app/**", "src/**"],
+    blocked: [".env*", ".github/**", "tests/**", "package.json", "package-lock.json"],
   },
   issue_scope: {
     max_files_changed: 6,
@@ -177,14 +177,36 @@ const workerPolicyLimits = {
   max_diff_lines: 2_000,
   max_file_bytes: 2_000_000,
   max_patch_bytes: 5_000_000,
+  max_iterations: 6,
+  max_read_turns: 24,
 } as const;
 
 const defaultAllowedImages = new Set(["node:22-bookworm"]);
 
+export const workerMandatoryBlockedPaths = [
+  ".git/**",
+  ".github/**",
+  ".env*",
+  ".igzpatch.yml",
+  ".igzpatch.yaml",
+  "Dockerfile",
+  "docker-compose*.yml",
+  "docker-compose*.yaml",
+  "vercel.json",
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock*",
+  "tests/**",
+  "test/**",
+  "__tests__/**",
+] as const;
+
 export function enforceWorkerRepoPolicy(
   config: RepoConfig,
   env: Record<string, string | undefined> = process.env,
-): void {
+): RepoConfig {
   const violations = [
     ["sandbox.cpu_limit", config.sandbox.cpu_limit, workerPolicyLimits.cpu_limit],
     ["sandbox.memory_mb", config.sandbox.memory_mb, workerPolicyLimits.memory_mb],
@@ -193,6 +215,8 @@ export function enforceWorkerRepoPolicy(
     ["issue_scope.max_diff_lines", config.issue_scope.max_diff_lines, workerPolicyLimits.max_diff_lines],
     ["issue_scope.max_file_bytes", config.issue_scope.max_file_bytes, workerPolicyLimits.max_file_bytes],
     ["issue_scope.max_patch_bytes", config.issue_scope.max_patch_bytes, workerPolicyLimits.max_patch_bytes],
+    ["agent.max_iterations", config.agent.max_iterations, workerPolicyLimits.max_iterations],
+    ["agent.max_read_turns", config.agent.max_read_turns, workerPolicyLimits.max_read_turns],
   ] as const;
   for (const [name, value, maximum] of violations) {
     if (value > maximum) throw new RepoConfigValidationError(`${name} exceeds worker maximum ${maximum}`);
@@ -207,10 +231,29 @@ export function enforceWorkerRepoPolicy(
   if (!allowedImages.has(config.sandbox.image)) {
     throw new RepoConfigValidationError(`sandbox.image is not allowed by this worker: ${config.sandbox.image}`);
   }
+  if (config.sandbox.run_network !== "disabled") {
+    throw new RepoConfigValidationError("sandbox.run_network must remain disabled by worker policy");
+  }
+  if (config.sandbox.setup_network === "enabled" && env.IGZPATCH_ALLOW_SETUP_NETWORK !== "true") {
+    throw new RepoConfigValidationError(
+      "sandbox.setup_network requires explicit worker opt-in with IGZPATCH_ALLOW_SETUP_NETWORK=true",
+    );
+  }
+  if (!config.audit.store_tool_calls || !config.audit.store_command_logs) {
+    throw new RepoConfigValidationError("Worker policy requires tool-call and command audit records");
+  }
   for (const command of config.sandbox.setup) assertAllowedRepoCommand(command, "setup");
   for (const command of [...config.checks.required, ...config.checks.optional]) {
     assertAllowedRepoCommand(command, "check");
   }
+
+  return {
+    ...config,
+    paths: {
+      ...config.paths,
+      blocked: [...new Set([...config.paths.blocked, ...workerMandatoryBlockedPaths])],
+    },
+  };
 }
 
 export function assertAllowedRepoCommand(command: string, phase: "setup" | "check"): void {
@@ -225,6 +268,16 @@ export function assertAllowedRepoCommand(command: string, phase: "setup" | "chec
     : ["npm", "pnpm", "yarn"].includes(binary ?? "")
       && (subcommand === "test" || subcommand === "run" || subcommand === "exec");
   if (!allowed) throw new RepoConfigValidationError(`${phase} command is not allowlisted: ${command}`);
+  if (phase === "setup" && ["npm", "pnpm", "yarn"].includes(binary ?? "")) {
+    const setupArguments = words.slice(2);
+    const forbiddenOption = setupArguments.find((argument) =>
+      !argument.startsWith("-")
+      || /^--?(?:registry|proxy|https-proxy|userconfig|cafile|prefix|global)(?:=|$)/i.test(argument)
+    );
+    if (forbiddenOption) {
+      throw new RepoConfigValidationError(`setup command contains an unsafe package source or target: ${command}`);
+    }
+  }
 }
 
 export async function loadRepoConfigFromGitHub({

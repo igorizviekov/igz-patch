@@ -41,10 +41,12 @@ paths:
   allowed:
     - app/**
     - src/**
-    - tests/**
   blocked:
     - .env*
-    - .github/workflows/**
+    - .github/**
+    - tests/**
+    - package.json
+    - package-lock.json
     - infra/**
     - auth/**
     - payments/**

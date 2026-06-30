@@ -22,6 +22,14 @@ function absolute(value) {
   return { normalized, result };
 }
 
+function readable(value) {
+  const resolved = absolute(value);
+  const realWorkspace = fs.realpathSync(workspace);
+  const realResult = fs.realpathSync(resolved.result);
+  if (realResult !== realWorkspace && !realResult.startsWith(realWorkspace + path.sep)) throw new Error("Path escapes through symlink");
+  return { normalized: resolved.normalized, result: realResult };
+}
+
 function isSensitive(value) {
   const normalized = normalizePath(value);
   const parts = normalized.split("/");
@@ -76,14 +84,14 @@ const args = payload.arguments || {};
 let output;
 switch (payload.name) {
   case "list_files": {
-    const start = absolute(args.path || ".").result;
+    const start = readable(args.path || ".").result;
     const files = collect(start).map((file) => path.relative(workspace, file).split(path.sep).join("/")).filter((file) => !isSensitive(file));
     output = JSON.stringify({ ok: true, files, truncated: files.length === 500 });
     break;
   }
   case "read_file": {
     if (isSensitive(args.path)) throw new Error("Refusing to read sensitive path");
-    const file = absolute(args.path).result;
+    const file = readable(args.path).result;
     const stat = fs.statSync(file);
     if (!stat.isFile() || stat.size > 1000000) throw new Error("File is unavailable or too large");
     const start = Number.isInteger(args.start_line) && args.start_line > 0 ? args.start_line : 1;
@@ -95,7 +103,7 @@ switch (payload.name) {
     const query = String(args.query || "").toLocaleLowerCase();
     if (!query) throw new Error("query must be non-empty");
     const matches = [];
-    for (const file of collect(absolute(args.path || ".").result)) {
+    for (const file of collect(readable(args.path || ".").result)) {
       const relative = path.relative(workspace, file).split(path.sep).join("/");
       if (isSensitive(relative) || fs.statSync(file).size > 1000000) continue;
       const content = fs.readFileSync(file, "utf8");

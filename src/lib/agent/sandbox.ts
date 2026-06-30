@@ -83,7 +83,9 @@ export function createDockerSandbox({
     mkdirSync(runtimeDirectory, { recursive: true });
     const name = nextContainerName(phase);
     activeContainers.add(name);
-    const effectiveContainerEnv = { ...runtimeEnv, ...containerEnv };
+    const effectiveContainerEnv = phase === "setup"
+      ? { ...containerEnv }
+      : { ...runtimeEnv, ...containerEnv };
     const processEnv = {
       ...safeExecutionEnvironment(env as NodeJS.ProcessEnv),
       ...(env.DOCKER_CONTEXT ? { DOCKER_CONTEXT: env.DOCKER_CONTEXT } : {}),
@@ -133,7 +135,7 @@ export function createDockerSandbox({
     },
     async runCommand({ command, phase, timeoutMs }) {
       assertAllowedRepoCommand(command, phase === "setup" ? "setup" : "check");
-      const normalizedCommand = normalizeSandboxCommand(command);
+      const normalizedCommand = normalizeSandboxCommand(command, phase);
       const script = renderSandboxScript(normalizedCommand);
       const result = await runContainer({
         image: config.sandbox.image,
@@ -176,7 +178,11 @@ export function createDockerSandbox({
           model,
           "-",
         ],
-        containerEnv: { CODEX_API_KEY: apiKey, CODEX_HOME: "/codex-home" },
+        containerEnv: {
+          CODEX_API_KEY: apiKey,
+          CODEX_HOME: "/codex-home",
+          LD_PRELOAD: "/usr/local/lib/libigzpatch-nodump.so",
+        },
         displayCommand: "docker run [Codex provider]",
         workspaceReadOnly: readOnly,
       });
@@ -236,7 +242,7 @@ export function buildDockerRunArgs({
     ? "bridge"
     : phase === "setup"
       ? config.sandbox.setup_network === "enabled" ? "bridge" : "none"
-      : config.sandbox.run_network === "enabled" ? "bridge" : "none";
+      : "none";
   const user = typeof process.getuid === "function" && typeof process.getgid === "function"
     ? `${process.getuid()}:${process.getgid()}`
     : null;
@@ -244,7 +250,6 @@ export function buildDockerRunArgs({
     "run",
     "--rm",
     "--interactive",
-    "--init",
     "--name",
     name,
     "--network",
@@ -275,7 +280,7 @@ export function buildDockerRunArgs({
     "--entrypoint",
     entrypoint,
   ];
-  if (phase === "provider") args.push("--security-opt", "seccomp=unconfined");
+  if (phase !== "provider") args.splice(3, 0, "--init");
   if (user) args.push("--user", user);
   for (const name of Object.keys(containerEnv)) args.push("--env", name);
   args.push(image, ...commandArgs);
@@ -289,6 +294,9 @@ function renderSandboxScript(command: string): string {
     "export XDG_CACHE_HOME=/workspace/.igzpatch-runtime/cache",
     "export COREPACK_HOME=/workspace/.igzpatch-runtime/corepack",
     "export npm_config_cache=/workspace/.igzpatch-runtime/npm",
+    "export npm_config_ignore_scripts=true",
+    "export PNPM_IGNORE_SCRIPTS=true",
+    "export YARN_ENABLE_SCRIPTS=false",
     "mkdir -p \"$HOME\" \"$XDG_CACHE_HOME\" \"$COREPACK_HOME\" \"$npm_config_cache\" /workspace/.igzpatch-runtime/bin",
     "export PATH=/workspace/.igzpatch-runtime/bin:/workspace/node_modules/.bin:$PATH",
     "if command -v corepack >/dev/null 2>&1; then corepack enable --install-directory /workspace/.igzpatch-runtime/bin >/dev/null 2>&1 || true; fi",
@@ -296,10 +304,16 @@ function renderSandboxScript(command: string): string {
   ].join("\n");
 }
 
-function normalizeSandboxCommand(command: string): string {
-  return command.trim() === "corepack enable"
-    ? "corepack enable --install-directory /workspace/.igzpatch-runtime/bin"
-    : command;
+function normalizeSandboxCommand(command: string, phase: SandboxPhase): string {
+  const trimmed = command.trim();
+  if (trimmed === "corepack enable") {
+    return "corepack enable --install-directory /workspace/.igzpatch-runtime/bin";
+  }
+  if (phase !== "setup" || /(?:^|\s)--ignore-scripts(?:\s|$)/.test(trimmed)) return trimmed;
+  const [binary, subcommand] = trimmed.split(/\s+/);
+  return ["npm", "pnpm", "yarn"].includes(binary ?? "") && ["ci", "install"].includes(subcommand ?? "")
+    ? `${trimmed} --ignore-scripts`
+    : trimmed;
 }
 
 async function removeContainer(

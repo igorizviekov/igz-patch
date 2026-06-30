@@ -9,7 +9,7 @@ import type {
   ModelInput,
   ModelTurn,
 } from "@/lib/agent/providers/types";
-import { buildAgentPrompt } from "@/lib/agent/providers/prompt";
+import { buildAgentInstructions, buildAgentTask } from "@/lib/agent/providers/prompt";
 
 interface OpenAiOutputItem extends Record<string, unknown> {
   type?: string;
@@ -41,6 +41,7 @@ export async function runOpenAiAgent(
     fetchImpl: options.fetchImpl ?? fetch,
     organization: env.OPENAI_ORG_ID,
     project: env.OPENAI_PROJECT_ID,
+    instructions: buildAgentInstructions(request.config),
   });
   const toolbox = createAgentToolbox({
     workspace: request.workspace,
@@ -57,7 +58,7 @@ export async function runOpenAiAgent(
 
   return runToolAgent({
     session,
-    prompt: buildAgentPrompt(request),
+    prompt: buildAgentTask(request.run),
     toolbox,
     maxIterations: request.config.agent.max_iterations,
     maxReadTurns: request.config.agent.max_read_turns,
@@ -74,6 +75,7 @@ export function createOpenAiSession({
   fetchImpl,
   organization,
   project,
+  instructions,
 }: {
   apiKey: string;
   baseUrl: string;
@@ -82,6 +84,7 @@ export function createOpenAiSession({
   fetchImpl: typeof fetch;
   organization?: string;
   project?: string;
+  instructions: string;
 }): AgentModelSession {
   let conversationItems: Array<Record<string, unknown>> = [];
 
@@ -99,6 +102,7 @@ export function createOpenAiSession({
         },
         body: JSON.stringify({
           model,
+          instructions,
           input: requestInput,
           tools: tools.map(toOpenAiTool),
           parallel_tool_calls: false,

@@ -19,6 +19,7 @@ import { renderPublicationTitle } from "@/lib/agent/publication";
 import { defaultRepoConfig, enforceWorkerRepoPolicy, type RepoConfig } from "@/lib/agent/repo-config";
 import { loadRepoConfig } from "@/lib/agent/repo-config-local";
 import { createDockerSandbox, type AgentSandbox } from "@/lib/agent/sandbox";
+import { assertNoSecretExposure } from "@/lib/agent/secret-safety";
 import {
   addRunEvent,
   addRunEventWithLease,
@@ -154,6 +155,7 @@ export async function executeRun(
     const agentResult = await runAgent(workspace, currentRun, config, sandbox, deadline, addEvent);
     agentProvider = agentResult.provider;
     agentModel = agentResult.model;
+    assertNoSecretExposure(agentResult.changeSummary, config.audit.redact_patterns);
     const publicationTitle = renderPublicationTitle(
       config.pull_request.title_template,
       agentResult.changeSummary,
@@ -166,13 +168,13 @@ export async function executeRun(
       change_summary: agentResult.changeSummary,
       summary: truncateText(redactText(agentResult.summary, config.audit.redact_patterns)),
     });
-    await runChecks(sandbox, config, deadline, addEvent);
     await assertRunActive(run.id, lease, assertHeartbeat);
     sandbox.cleanupRuntime();
 
     const diffSummary = await readDiffSummary(workspace);
     enforceDiffPolicy(diffSummary, config);
     const patch = await readBinaryPatch(workspace, config.issue_scope.max_patch_bytes);
+    assertNoSecretExposure(patch, config.audit.redact_patterns);
     await addEvent("diff", "Untrusted diff policy passed", {
       changed_files: diffSummary.changedFiles,
       added_lines: diffSummary.addedLines,
@@ -195,12 +197,38 @@ export async function executeRun(
       remainingTimeout(deadline, 120_000),
     );
     await applyPatch(trustedWorkspace, patch, remainingTimeout(deadline, 120_000));
-    const trustedDiffSummary = await readDiffSummary(trustedWorkspace);
+    let trustedDiffSummary = await readDiffSummary(trustedWorkspace);
     enforceDiffPolicy(trustedDiffSummary, config);
     await addEvent("trusted_patch", "Patch applied to fresh trusted checkout", {
       changed_files: trustedDiffSummary.changedFiles,
       patch_bytes: trustedDiffSummary.patchBytes,
     });
+
+    sandbox = createDockerSandbox({
+      workspace: trustedWorkspace,
+      runId: `${run.id}-verification`,
+      config,
+      runtimeEnv: {
+        IGZPATCH_RUN_ID: run.id,
+        IGZPATCH_REPOSITORY: run.repository_full_name,
+        IGZPATCH_ISSUE_NUMBER: String(run.issue_number),
+        IGZPATCH_ISSUE_TITLE: run.issue_title,
+      },
+    });
+    await sandbox.ensureAvailable();
+    await addEvent("trusted_verification", "Running setup and checks in the fresh publication checkout");
+    await runSetup(sandbox, config, deadline, addEvent);
+    await runChecks(sandbox, config, deadline, addEvent);
+    sandbox.cleanupRuntime();
+    const verifiedPatch = await readBinaryPatch(trustedWorkspace, config.issue_scope.max_patch_bytes);
+    if (verifiedPatch !== patch) {
+      throw new BlockedRunError("Setup or verification changed the publication patch.");
+    }
+    trustedDiffSummary = await readDiffSummary(trustedWorkspace);
+    enforceDiffPolicy(trustedDiffSummary, config);
+    await sandbox.dispose();
+    sandbox = null;
+    await addEvent("trusted_verification_passed", "Fresh-checkout required checks passed");
 
     await git(trustedWorkspace, ["add", "-A"], safeExecutionEnvironment(), remainingTimeout(deadline, 120_000));
     await git(
@@ -309,7 +337,7 @@ export async function executeRun(
             details: [
               ...(agentProvider ? [`Provider: \`${safeMetadataValue(agentProvider)}\``] : []),
               ...(agentModel ? [`Model: \`${safeMetadataValue(agentModel)}\``] : []),
-              message,
+              publicFailureMessage(message),
             ],
           }),
         );
@@ -369,11 +397,17 @@ async function runSetup(
   addEvent: RunEventWriter,
 ): Promise<void> {
   for (const command of config.sandbox.setup) {
-    const result = await sandbox.runCommand({
-      command,
-      phase: "setup",
-      timeoutMs: remainingTimeout(deadline, config.sandbox.timeout_minutes * 60_000),
-    });
+    let result: CommandResult;
+    try {
+      result = await sandbox.runCommand({
+        command,
+        phase: "setup",
+        timeoutMs: remainingTimeout(deadline, config.sandbox.timeout_minutes * 60_000),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new BlockedRunError(`Setup policy failed: ${message}`);
+    }
     await recordCommandEvent("setup_command", result, config, addEvent);
     assertBlockingCommandSucceeded(result, "Setup command failed");
   }
@@ -499,8 +533,7 @@ async function openDraftPullRequest({
 function loadConfigOrBlock(workspace: string) {
   try {
     const config = loadRepoConfig(workspace);
-    enforceWorkerRepoPolicy(config);
-    return config;
+    return enforceWorkerRepoPolicy(config);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new BlockedRunError(`Repository config validation failed: ${message}`);
@@ -553,6 +586,11 @@ function renderPullRequestBody({
 
 function safeMetadataValue(value: string): string {
   return value.replace(/[`\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+function publicFailureMessage(message: string): string {
+  const firstLine = message.split(/\r?\n/, 1)[0]?.trim() || "Run stopped without a publishable patch.";
+  return `Reason: ${safeMetadataValue(firstLine).slice(0, 300)}`;
 }
 
 function formatBranchName(prefix: string, run: RunRecord): string {
