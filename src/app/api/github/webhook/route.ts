@@ -70,7 +70,8 @@ export async function POST(request: NextRequest) {
   const [owner, repo] = repositoryContext.repositoryFullName.split("/");
   if (!owner || !repo) return NextResponse.json({ error: "Invalid repository name" }, { status: 400 });
 
-  const candidate = durableRunCandidate({ eventName, deliveryId, payload });
+  const allowPublicFixCommands = process.env.IGZPATCH_ALLOW_PUBLIC_FIX_COMMANDS === "true";
+  const candidate = durableRunCandidate({ eventName, deliveryId, payload, allowPublicFixCommands });
   const durableRun = candidate ? await createRun(candidate) : null;
   const ownsDurableDelivery = durableRun?.github_delivery_id === deliveryId;
 
@@ -133,7 +134,13 @@ export async function POST(request: NextRequest) {
   }
   if (!repoConfig.enabled) return blockRun(durableRun, "IgzPatch is disabled by repository config.", octokit);
 
-  const configuredInput = runInputFromWebhook({ eventName, deliveryId, payload, triggers: repoConfig.triggers });
+  const configuredInput = runInputFromWebhook({
+    eventName,
+    deliveryId,
+    payload,
+    triggers: repoConfig.triggers,
+    allowPublicFixCommands,
+  });
   if (!configuredInput) {
     return blockRun(durableRun, "Webhook trigger does not match repository config.", octokit);
   }

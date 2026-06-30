@@ -64,17 +64,19 @@ export function durableRunCandidate({
   eventName,
   deliveryId,
   payload,
+  allowPublicFixCommands = false,
 }: {
   eventName: string;
   deliveryId: string;
   payload: WebhookPayload;
+  allowPublicFixCommands?: boolean;
 }): CreateRunInput | null {
   if (!payload.issue || payload.issue.pull_request) return null;
   const trigger = eventName === "issues" && payload.action === "labeled"
     ? payload.label?.name?.trim() || null
     : eventName === "issue_comment"
       && payload.action === "created"
-      && isMaintainerAssociation(payload.comment?.author_association)
+      && (allowPublicFixCommands || isMaintainerAssociation(payload.comment?.author_association))
       ? String(payload.comment?.body ?? "").split(/\r?\n/).map((line) => line.trim())
           .find((line) => /^@[^\s]+\s+fix$/i.test(line)) ?? null
       : null;
@@ -87,11 +89,13 @@ export function runInputFromWebhook({
   deliveryId,
   payload,
   triggers,
+  allowPublicFixCommands = false,
 }: {
   eventName: string;
   deliveryId: string;
   payload: WebhookPayload;
   triggers: RepoConfig["triggers"];
+  allowPublicFixCommands?: boolean;
 }): CreateRunInput | null {
   if (eventName !== "issues" && eventName !== "issue_comment") return null;
   if (!payload.issue || payload.issue.pull_request) return null;
@@ -103,7 +107,7 @@ export function runInputFromWebhook({
   }
 
   if (eventName === "issue_comment") {
-    const command = issueCommentTrigger(payload, triggers.commands);
+    const command = issueCommentTrigger(payload, triggers.commands, allowPublicFixCommands);
     if (!command || commandAction(command) !== "fix") return null;
     return baseRunInput(payload, deliveryId, "issue_comment.command", command);
   }
@@ -162,14 +166,20 @@ function baseRunInput(
   };
 }
 
-function issueCommentTrigger(payload: WebhookPayload, commands: string[]): string | null {
+function issueCommentTrigger(
+  payload: WebhookPayload,
+  commands: string[],
+  allowPublicFixCommands = false,
+): string | null {
   if (payload.action !== "created") return null;
-  if (!isMaintainerAssociation(payload.comment?.author_association)) return null;
   const lines = String(payload.comment?.body ?? "")
     .split(/\r?\n/)
     .map(normalize)
     .filter(Boolean);
-  return commands.find((command) => lines.includes(normalize(command))) ?? null;
+  const command = commands.find((candidate) => lines.includes(normalize(candidate))) ?? null;
+  if (!command) return null;
+  if (isMaintainerAssociation(payload.comment?.author_association)) return command;
+  return allowPublicFixCommands && commandAction(command) === "fix" ? command : null;
 }
 
 function isMaintainerAssociation(value: unknown): boolean {

@@ -98,7 +98,7 @@ test("status and stop commands are classified but do not enqueue fix runs", () =
   }
 });
 
-test("issue commands require a maintainer association", () => {
+test("public fix commands require an explicit control-plane opt in", () => {
   const payload = {
     ...basePayload,
     action: "created",
@@ -119,6 +119,47 @@ test("issue commands require a maintainer association", () => {
     }),
     null,
   );
+  assert.equal(
+    runInputFromWebhook({
+      eventName: "issue_comment",
+      deliveryId: "delivery-public-fix",
+      payload,
+      triggers,
+      allowPublicFixCommands: true,
+    })?.triggerActor,
+    "outside-contributor",
+  );
+  assert.equal(
+    durableRunCandidate({
+      eventName: "issue_comment",
+      deliveryId: "durable-public-fix",
+      payload,
+      allowPublicFixCommands: true,
+    })?.triggerValue,
+    "@IgzPatch fix",
+  );
+});
+
+test("public status and stop commands remain maintainer-only", () => {
+  for (const action of ["status", "stop"] as const) {
+    const payload = {
+      ...basePayload,
+      action: "created",
+      comment: {
+        body: `@IgzPatch ${action}`,
+        user: { login: "outside-contributor" },
+        author_association: "NONE",
+      },
+    };
+    assert.equal(configuredIssueCommand(payload, triggers.commands), null);
+    assert.equal(runInputFromWebhook({
+      eventName: "issue_comment",
+      deliveryId: `delivery-public-${action}`,
+      payload,
+      triggers,
+      allowPublicFixCommands: true,
+    }), null);
+  }
 });
 
 test("pull request comments and incomplete repository contexts are ignored", () => {

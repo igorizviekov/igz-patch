@@ -4,7 +4,7 @@ IgzPatch is a GitHub App that turns explicitly labeled issues into verified draf
 
 ## Features
 
-- Triggers from configured labels or maintainer-only `@IgzPatch fix`, `@IgzPatch status`, and `@IgzPatch stop` commands.
+- Triggers from configured labels or `@IgzPatch fix`; public fix commands are optional, while `status` and `stop` remain maintainer-only.
 - Authenticates with short-lived GitHub App installation tokens, never personal credentials.
 - Supports configurable Codex CLI and OpenAI Responses API providers and models.
 - Blocks explicit policy overrides, verification bypasses, protected-path tampering, and credential-access requests before invoking an agent.
@@ -60,6 +60,8 @@ npm run build
 3. Grant Metadata read, Contents read/write, Issues read/write, Pull requests read/write, and Checks read; subscribe to Issues and Issue comments.
 4. Create a webhook secret and private key, then install the App only on selected repositories.
 5. Add `GITHUB_APP_ID`, `GITHUB_WEBHOOK_SECRET`, and `GITHUB_PRIVATE_KEY` to `.env` and Vercel, then redeploy. Store the PEM on one quoted line with literal `\n` separators.
+
+To let any GitHub user trigger the configured fix command, set `IGZPATCH_ALLOW_PUBLIC_FIX_COMMANDS="true"` on Vercel and redeploy.
 
 ### 6. Run
 
